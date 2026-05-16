@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import functools
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -36,6 +37,9 @@ else:
     )
 
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
+from sglang.srt.layers.attention.dsv4.index_buf_accessor import (
+    fp8_dtype as dsv4_fp8_dtype,
+)
 from sglang.srt.layers.attention.dsv4.metadata import (
     PagedIndexerMetadata,
     copy_metadata,
@@ -80,10 +84,172 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
     return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
 
 
-def _create_flashmla_metadata():
-    import flash_mla
+def _get_flash_mla_module():
+    try:
+        import flash_mla
+    except ImportError:
+        return None
 
+    return flash_mla
+
+
+def _create_flashmla_metadata():
+    flash_mla = _get_flash_mla_module()
+    if flash_mla is None:
+        return None
     return flash_mla.get_mla_metadata()[0]
+
+
+_TORCH_FALLBACK_WARNED = False
+_ATTN_FIXTURE_DUMP_COUNT = 0
+
+
+def _clone_for_fixture(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if x is None:
+        return None
+    return x.detach().cpu().contiguous()
+
+
+def _maybe_dump_dsv4_attention_fixture(
+    *,
+    q: torch.Tensor,
+    swa_k_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_topk_lengths: torch.Tensor,
+    swa_page_size: int,
+    softmax_scale: float,
+    attn_sink: Optional[torch.Tensor],
+    expected: torch.Tensor,
+    layer_id: int,
+    compress_ratio: Literal[0, 4, 128],
+    extra_k_cache: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    extra_topk_lengths: Optional[torch.Tensor] = None,
+    extra_page_size: Optional[int] = None,
+) -> None:
+    dump_dir = os.environ.get("SGLANG_DSV4_FIXTURE_DIR")
+    if not dump_dir:
+        return
+
+    global _ATTN_FIXTURE_DUMP_COUNT
+    limit = int(os.environ.get("SGLANG_DSV4_FIXTURE_LIMIT", "1"))
+    if _ATTN_FIXTURE_DUMP_COUNT >= limit:
+        return
+
+    dump_id = _ATTN_FIXTURE_DUMP_COUNT
+    _ATTN_FIXTURE_DUMP_COUNT += 1
+    os.makedirs(dump_dir, exist_ok=True)
+    path = os.path.join(
+        dump_dir,
+        (
+            f"ds4_attn_pid{os.getpid()}_"
+            f"{dump_id:04d}_layer{layer_id}_cr{compress_ratio}.pt"
+        ),
+    )
+
+    fixture = {
+        "q": _clone_for_fixture(q),
+        "swa_k_cache": _clone_for_fixture(swa_k_cache),
+        "swa_indices": _clone_for_fixture(swa_indices),
+        "swa_topk_lengths": _clone_for_fixture(swa_topk_lengths),
+        "swa_page_size": int(swa_page_size),
+        "softmax_scale": float(softmax_scale),
+        "attn_sink": _clone_for_fixture(attn_sink),
+        "expected": _clone_for_fixture(expected),
+        "extra_k_cache": _clone_for_fixture(extra_k_cache),
+        "extra_indices": _clone_for_fixture(extra_indices),
+        "extra_topk_lengths": _clone_for_fixture(extra_topk_lengths),
+        "extra_page_size": None if extra_page_size is None else int(extra_page_size),
+        "layout": "dsv4_packed",
+        "layer_id": int(layer_id),
+        "compress_ratio": int(compress_ratio),
+    }
+    torch.save(fixture, path)
+    logger.warning("dumped DeepSeek V4 attention fixture to %s", path)
+
+
+def _dequantize_dsv4_kv_cache_torch(
+    k_cache: torch.Tensor,
+    indices: torch.Tensor,
+    topk_lengths: torch.Tensor,
+    page_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    flat_indices = indices.reshape(-1, indices.shape[-1]).to(torch.long)
+    flat_lengths = topk_lengths.reshape(-1).to(torch.long)
+    max_topk = int(torch.clamp(flat_lengths.max(), min=1).item())
+    max_topk = min(max_topk, flat_indices.shape[-1])
+
+    flat_indices = flat_indices[:, :max_topk]
+    valid = torch.arange(max_topk, device=indices.device).unsqueeze(0) < flat_lengths[
+        :, None
+    ]
+    safe_indices = torch.clamp(flat_indices.masked_fill(~valid, 0), min=0)
+
+    page_indices = safe_indices // page_size
+    token_offsets = safe_indices % page_size
+    packed = k_cache[page_indices, token_offsets, 0].contiguous()
+
+    nope_q = packed[..., :448].contiguous().view(dsv4_fp8_dtype).to(torch.float32)
+    rope = packed[..., 448:576].contiguous().view(torch.bfloat16)
+    scales = torch.exp2(packed[..., 576:583].to(torch.float32) - 127.0)
+    nope = nope_q * scales.repeat_interleave(64, dim=-1)
+    kv = torch.cat([nope, rope.to(torch.float32)], dim=-1)
+    return kv, valid
+
+
+def _torch_sparse_mla_fallback(
+    *,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    indices: torch.Tensor,
+    topk_lengths: torch.Tensor,
+    attn_sink: Optional[torch.Tensor],
+    softmax_scale: float,
+    page_size: int,
+    extra_k_cache: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    extra_topk_lengths: Optional[torch.Tensor] = None,
+    extra_page_size: Optional[int] = None,
+) -> torch.Tensor:
+    global _TORCH_FALLBACK_WARNED
+    if not _TORCH_FALLBACK_WARNED:
+        logger.warning(
+            "flash_mla is not installed; using a slow DeepSeek V4 torch SWA "
+            "attention fallback. This is intended for short smoke tests only."
+        )
+        _TORCH_FALLBACK_WARNED = True
+
+    q_shape = q.shape
+    q_flat = q.reshape(-1, q.shape[-2], q.shape[-1])
+    kv, valid = _dequantize_dsv4_kv_cache_torch(
+        k_cache=k_cache,
+        indices=indices,
+        topk_lengths=topk_lengths,
+        page_size=page_size,
+    )
+    if extra_k_cache is not None:
+        assert extra_indices is not None
+        assert extra_topk_lengths is not None
+        assert extra_page_size is not None
+        extra_kv, extra_valid = _dequantize_dsv4_kv_cache_torch(
+            k_cache=extra_k_cache,
+            indices=extra_indices,
+            topk_lengths=extra_topk_lengths,
+            page_size=extra_page_size,
+        )
+        kv = torch.cat([kv, extra_kv], dim=1)
+        valid = torch.cat([valid, extra_valid], dim=1)
+    scores = torch.einsum("bhd,bkd->bhk", q_flat.float(), kv.float())
+    scores = scores * softmax_scale
+    scores = scores.masked_fill(~valid[:, None, :], -torch.inf)
+    lse = torch.logsumexp(scores, dim=-1)
+    weights = torch.softmax(scores, dim=-1)
+    weights = weights.masked_fill(~valid[:, None, :], 0.0)
+    out = torch.einsum("bhk,bkd->bhd", weights.to(kv.dtype), kv)
+    if attn_sink is not None:
+        sink = attn_sink.to(torch.float32).view(1, -1)
+        out = out * torch.sigmoid(lse - sink).unsqueeze(-1).to(out.dtype)
+    return out.reshape(*q_shape[:-2], q_shape[-2], out.shape[-1]).to(q.dtype)
 
 
 def _create_dummy_paged_compress_data(compress_ratio: int):
@@ -376,6 +542,7 @@ class DeepseekV4AttnBackend(
             DSV4RawVerifyMetadata,
             DSV4RawDecodeMetadata,
         ] = None
+        self.use_torch_fallback = _get_flash_mla_module() is None
         self._replay_forward_batch: Optional[ForwardBatch] = None  # FIXME: out-of-band
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
@@ -407,25 +574,32 @@ class DeepseekV4AttnBackend(
                 out_cache_loc=out_cache_loc,
             )
 
+        need_compress = not self.use_torch_fallback
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices,
             seq_lens_casual=seq_lens,
             max_seq_len=max_seq_len,
             out_loc=out_cache_loc,
-            need_compress=True,
+            need_compress=need_compress,
         )
 
-        indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
-
-        create = functools.partial(
-            create_paged_compressor_data,
-            is_prefill=False,
-            token_to_kv_pool=self.token_to_kv_pool,
-            req_to_token=self.req_to_token,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
+        indexer_metadata = (
+            self.init_forward_metadata_indexer(core_attn_metadata)
+            if need_compress
+            else None
         )
+        if need_compress:
+            create = functools.partial(
+                create_paged_compressor_data,
+                is_prefill=False,
+                token_to_kv_pool=self.token_to_kv_pool,
+                req_to_token=self.req_to_token,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+            )
+        else:
+            create = _create_dummy_paged_compress_data
 
         return DSV4Metadata(
             core_attn_metadata,
@@ -447,6 +621,7 @@ class DeepseekV4AttnBackend(
         need_compress: bool = True,
         use_prefill_cuda_graph: bool = False,
     ) -> DSV4Metadata:
+        need_compress = need_compress and not self.use_torch_fallback
         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
             num_tokens=num_tokens,
             seq_lens=seq_lens_cpu,
@@ -985,16 +1160,18 @@ class DeepseekV4AttnBackend(
                 swa_k_cache.shape[0], swa_window_size, 1, k_cache_total_dim
             )
 
+            extra_page_size = None
             if extra_k_cache is not None:
                 page_sizes = {
                     4: token_to_kv_pool.page_size // 4,
                     128: token_to_kv_pool.page_size // 128,
                 }
+                extra_page_size = page_sizes[compress_ratio]
                 extra_k_cache = extra_k_cache[
-                    :, : page_sizes[compress_ratio] * k_cache_total_dim
+                    :, : extra_page_size * k_cache_total_dim
                 ].view(
                     extra_k_cache.shape[0],
-                    page_sizes[compress_ratio],
+                    extra_page_size,
                     1,
                     k_cache_total_dim,
                 )
@@ -1031,24 +1208,56 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            import flash_mla
+            flash_mla = _get_flash_mla_module()
 
-            o = flash_mla.flash_mla_with_kvcache(
+            if flash_mla is None:
+                o = _torch_sparse_mla_fallback(
+                    q=q,
+                    k_cache=swa_k_cache,
+                    indices=swa_page_indices,
+                    topk_lengths=swa_topk_lengths,
+                    attn_sink=attn_sink,
+                    softmax_scale=self.softmax_scale,
+                    page_size=token_to_kv_pool.swa_page_size,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_lengths=extra_topk_lengths,
+                    extra_page_size=extra_page_size,
+                )
+            else:
+                o = flash_mla.flash_mla_with_kvcache(
+                    q=q,
+                    k_cache=swa_k_cache,
+                    head_dim_v=self.head_dim_v,
+                    block_table=None,
+                    cache_seqlens=None,
+                    tile_scheduler_metadata=flashmla_metadata,
+                    softmax_scale=self.softmax_scale,
+                    is_fp8_kvcache=True,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    attn_sink=attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices_in_kvcache=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                )[0]
+
+            _maybe_dump_dsv4_attention_fixture(
                 q=q,
-                k_cache=swa_k_cache,
-                head_dim_v=self.head_dim_v,
-                block_table=None,
-                cache_seqlens=None,
-                tile_scheduler_metadata=flashmla_metadata,
+                swa_k_cache=swa_k_cache,
+                swa_indices=swa_page_indices,
+                swa_topk_lengths=swa_topk_lengths,
+                swa_page_size=token_to_kv_pool.swa_page_size,
                 softmax_scale=self.softmax_scale,
-                is_fp8_kvcache=True,
-                indices=swa_page_indices,
-                topk_length=swa_topk_lengths,
                 attn_sink=attn_sink,
+                expected=o,
+                layer_id=layer_id,
+                compress_ratio=compress_ratio,
                 extra_k_cache=extra_k_cache,
-                extra_indices_in_kvcache=extra_indices,
-                extra_topk_length=extra_topk_lengths,
-            )[0]
+                extra_indices=extra_indices,
+                extra_topk_lengths=extra_topk_lengths,
+                extra_page_size=extra_page_size,
+            )
 
             o = o.squeeze(1)
             return o

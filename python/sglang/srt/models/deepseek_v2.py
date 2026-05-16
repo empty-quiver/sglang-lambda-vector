@@ -270,6 +270,7 @@ class DeepseekV2MLP(nn.Module):
         if (
             gemm_output_zero_allocator is not None
             and x.shape[0] <= 256
+            and getattr(self.gate_up_proj, "weight", None) is not None
             and self.gate_up_proj.weight.dtype == torch.uint8
         ):
             y = gemm_output_zero_allocator.allocate(
@@ -284,6 +285,7 @@ class DeepseekV2MLP(nn.Module):
         if (
             self.swiglu_limit is not None
             and not self.down_proj.reduce_results
+            and getattr(self.down_proj, "weight", None) is not None
             and self.down_proj.weight.dtype == torch.uint8
             and hasattr(self.down_proj, "weight_scale_inv")
         ):
@@ -615,6 +617,9 @@ class DeepseekV2MoE(nn.Module):
                 **(dict(tp_rank=0, tp_size=1) if _shared_expert_use_tp1 else {}),
             )
             self._shared_expert_tp1 = _shared_expert_use_tp1
+            shared_gate_up_weight = getattr(
+                self.shared_experts.gate_up_proj, "weight", None
+            )
             is_packed_weight = hasattr(
                 self.shared_experts.gate_up_proj.quant_method, "quant_config"
             ) and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name() in {
@@ -624,11 +629,13 @@ class DeepseekV2MoE(nn.Module):
             }
             self.shared_experts_is_int8 = (
                 not is_packed_weight
-                and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
+                and shared_gate_up_weight is not None
+                and shared_gate_up_weight.dtype == torch.int8
             )
             self.shared_experts_is_fp8 = (
                 not is_packed_weight
-                and self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn
+                and shared_gate_up_weight is not None
+                and shared_gate_up_weight.dtype == torch.float8_e4m3fn
             )
             if self.shared_experts_is_fp8:
                 if (

@@ -80,6 +80,19 @@ logger = logging.getLogger(__name__)
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 
 
+def _supports_dsv4_optimized_cuda_kernels(x: Optional[torch.Tensor] = None) -> bool:
+    if not torch.cuda.is_available():
+        return False
+
+    try:
+        device = x.device if x is not None and x.is_cuda else None
+        major, _ = torch.cuda.get_device_capability(device)
+    except Exception:
+        return False
+
+    return major >= 9
+
+
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import (
         DeepseekV4AttnBackend,
@@ -426,7 +439,9 @@ class MQALayer(nn.Module):
         q_lora = self._compute_q_a(x, qkv_a=qkv_a)
         q_lora_ready = current_stream.record_event()
 
-        if self.indexer is not None:
+        if self.indexer is not None and not getattr(
+            attn_backend, "use_torch_fallback", False
+        ):
             with torch.cuda.stream(stream_indexer):
                 self.indexer(
                     x=x,
@@ -444,7 +459,9 @@ class MQALayer(nn.Module):
 
         del qkv_a
 
-        if self.compressor is not None:
+        if self.compressor is not None and not getattr(
+            attn_backend, "use_torch_fallback", False
+        ):
             with torch.cuda.stream(stream_compressor):
                 attn_backend.forward_core_compressor(
                     x, forward_batch, self.layer_id, self.compressor
@@ -497,9 +514,13 @@ class MQALayer(nn.Module):
 
         del qkv_a
 
-        if self.indexer is not None:
+        if self.indexer is not None and not getattr(
+            attn_backend, "use_torch_fallback", False
+        ):
             self.indexer(x=x, q_lora=q_lora, forward_batch=forward_batch)
-        if self.compressor is not None:
+        if self.compressor is not None and not getattr(
+            attn_backend, "use_torch_fallback", False
+        ):
             attn_backend.forward_core_compressor(
                 x,
                 forward_batch,
@@ -688,7 +709,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post, comb, False
 
-        if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+        use_optimized_mhc = _supports_dsv4_optimized_cuda_kernels(x)
+
+        if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get() and use_optimized_mhc:
             from sglang.srt.layers.mhc import mhc_pre
 
             norm_kwargs = {}
@@ -710,7 +733,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post.squeeze(-1), comb, norm is not None
 
-        if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+        if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get() and use_optimized_mhc:
             import deep_gemm
 
             x_flat = x.flatten(1).bfloat16()
@@ -753,7 +776,10 @@ class DeepseekV4DecoderLayer(nn.Module):
                 (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
             )
 
-        if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
+        if (
+            envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get()
+            and _supports_dsv4_optimized_cuda_kernels(x)
+        ):
             from sglang.srt.layers.mhc import mhc_post
 
             return mhc_post(x, residual, post, comb)
@@ -779,6 +805,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
     ) -> torch.Tensor:
+        if hidden_states.dtype != torch.bfloat16:
+            hidden_states = hidden_states.to(torch.bfloat16)
         residual = hidden_states
         hidden_states, post, comb, norm_fused = self.hc_pre(
             hidden_states,
@@ -874,6 +902,8 @@ class DeepseekV4Model(nn.Module):
             config.vocab_size,
             config.hidden_size,
             enable_tp=not is_dp_attention_enabled(),
+            quant_config=quant_config,
+            prefix=add_prefix("embed_tokens", prefix),
         )
         self.rms_norm_eps = config.rms_norm_eps
         self.alt_streams = (
@@ -942,6 +972,8 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
+        if hidden_states.dtype != torch.bfloat16:
+            hidden_states = hidden_states.to(torch.bfloat16)
         hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
 
         if get_attention_dp_size() > 1 and get_moe_a2a_backend().is_none():
@@ -1208,7 +1240,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+        is_gguf = self.quant_config and self.quant_config.get_name() == "gguf"
+        if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get() and not is_gguf:
             weights = list(weights)
             exists_wo_a_scale = any(n.endswith(".wo_a.scale") for n, t in weights)
             if exists_wo_a_scale:
@@ -1216,6 +1249,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                 weights = _dequant_fp8_wo_a(weights)
             else:
                 logger.info("Skip dequant fp8 wo_a")
+        elif is_gguf:
+            logger.info("Skip dequant fp8 wo_a for GGUF weights")
 
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
@@ -1426,8 +1461,12 @@ class DeepseekV4ForCausalLM(nn.Module):
                             elif fuse_wqa_wkv and (
                                 name.endswith(".wq_a.weight")
                                 or name.endswith(".wq_a.weight_scale_inv")
+                                or name.endswith(".wq_a.qweight")
+                                or name.endswith(".wq_a.qweight_type")
                                 or name.endswith(".wkv.weight")
                                 or name.endswith(".wkv.weight_scale_inv")
+                                or name.endswith(".wkv.qweight")
+                                or name.endswith(".wkv.qweight_type")
                             ):
                                 is_q = ".wq_a." in name
                                 param_name = name.replace(
@@ -1440,9 +1479,19 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 ), f"duplicate shard {shard_key} for {param_name}"
                                 bucket[shard_key] = loaded_weight
                                 if len(bucket) == 2:
-                                    fused_weight = torch.cat(
-                                        [bucket["q"], bucket["kv"]], dim=0
-                                    )
+                                    if name.endswith(".qweight_type"):
+                                        if bucket["q"].item() != bucket["kv"].item():
+                                            raise ValueError(
+                                                "Cannot fuse GGUF wq_a/wkv with "
+                                                "different qweight_type values: "
+                                                f"{bucket['q'].item()} vs "
+                                                f"{bucket['kv'].item()}"
+                                            )
+                                        fused_weight = bucket["q"]
+                                    else:
+                                        fused_weight = torch.cat(
+                                            [bucket["q"], bucket["kv"]], dim=0
+                                        )
                                     param = params_dict[param_name]
                                     weight_loader = auto_weight_loader(param)
                                     maybe_executor_submit(

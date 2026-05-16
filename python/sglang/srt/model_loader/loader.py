@@ -2027,6 +2027,90 @@ class GGUFModelLoader(BaseModelLoader):
         else:
             raise ValueError(f"{model_name_or_path} is not a file.")
 
+    def _get_deepseek4_gguf_weights_map(self, config) -> Dict[str, str]:
+        num_layers = config.num_hidden_layers
+        compress_ratios = list(getattr(config, "compress_ratios", []) or [])
+        if len(compress_ratios) < num_layers:
+            compress_ratios = [
+                0 if layer_id < 2 else (4 if layer_id % 2 == 0 else 128)
+                for layer_id in range(num_layers)
+            ]
+
+        gguf_to_hf_name_map = {
+            "token_embd.weight": "model.embed_tokens.weight",
+            "output.weight": "lm_head.weight",
+            "output_norm.weight": "model.norm.weight",
+            "output_hc_base.weight": "model.hc_head_base",
+            "output_hc_fn.weight": "model.hc_head_fn",
+            "output_hc_scale.weight": "model.hc_head_scale",
+        }
+
+        layer_map = {
+            "attn_norm.weight": "input_layernorm.weight",
+            "ffn_norm.weight": "post_attention_layernorm.weight",
+            "attn_sinks.weight": "self_attn.attn_sink",
+            "attn_q_a.weight": "self_attn.wq_a.weight",
+            "attn_q_a_norm.weight": "self_attn.q_norm.weight",
+            "attn_q_b.weight": "self_attn.wq_b.weight",
+            "attn_kv.weight": "self_attn.wkv.weight",
+            "attn_kv_a_norm.weight": "self_attn.kv_norm.weight",
+            "attn_output_a.weight": "self_attn.wo_a.weight",
+            "attn_output_b.weight": "self_attn.wo_b.weight",
+            "ffn_gate_inp.weight": "mlp.gate.weight",
+            "ffn_gate_shexp.weight": "mlp.shared_experts.gate_proj.weight",
+            "ffn_up_shexp.weight": "mlp.shared_experts.up_proj.weight",
+            "ffn_down_shexp.weight": "mlp.shared_experts.down_proj.weight",
+            "hc_attn_fn.weight": "hc_attn_fn",
+            "hc_attn_base.weight": "hc_attn_base",
+            "hc_attn_scale.weight": "hc_attn_scale",
+            "hc_ffn_fn.weight": "hc_ffn_fn",
+            "hc_ffn_base.weight": "hc_ffn_base",
+            "hc_ffn_scale.weight": "hc_ffn_scale",
+        }
+        compressed_layer_map = {
+            "attn_compressor_ape.weight": "self_attn.compressor.ape",
+            "attn_compressor_norm.weight": "self_attn.compressor.norm.weight",
+            "attn_compressor_kv.weight": "self_attn.compressor.wkv.weight",
+            "attn_compressor_gate.weight": "self_attn.compressor.wgate.weight",
+        }
+        indexer_layer_map = {
+            "indexer.attn_q_b.weight": "self_attn.indexer.wq_b.weight",
+            "indexer.proj.weight": "self_attn.indexer.weights_proj.weight",
+            "indexer_compressor_ape.weight": "self_attn.indexer.compressor.ape",
+            "indexer_compressor_norm.weight": "self_attn.indexer.compressor.norm.weight",
+            "indexer_compressor_kv.weight": "self_attn.indexer.compressor.wkv.weight",
+            "indexer_compressor_gate.weight": "self_attn.indexer.compressor.wgate.weight",
+        }
+
+        for layer_id in range(num_layers):
+            prefix = f"model.layers.{layer_id}"
+            for gguf_suffix, hf_suffix in layer_map.items():
+                gguf_to_hf_name_map[f"blk.{layer_id}.{gguf_suffix}"] = (
+                    f"{prefix}.{hf_suffix}"
+                )
+            if layer_id < getattr(config, "n_hash_layers", 0):
+                gguf_to_hf_name_map[f"blk.{layer_id}.ffn_gate_tid2eid.weight"] = (
+                    f"{prefix}.mlp.topk.tid2eid"
+                )
+            else:
+                gguf_to_hf_name_map[f"blk.{layer_id}.exp_probs_b.bias"] = (
+                    f"{prefix}.mlp.gate.e_score_correction_bias"
+                )
+
+            compress_ratio = compress_ratios[layer_id]
+            if compress_ratio:
+                for gguf_suffix, hf_suffix in compressed_layer_map.items():
+                    gguf_to_hf_name_map[f"blk.{layer_id}.{gguf_suffix}"] = (
+                        f"{prefix}.{hf_suffix}"
+                    )
+            if compress_ratio == 4:
+                for gguf_suffix, hf_suffix in indexer_layer_map.items():
+                    gguf_to_hf_name_map[f"blk.{layer_id}.{gguf_suffix}"] = (
+                        f"{prefix}.{hf_suffix}"
+                    )
+
+        return gguf_to_hf_name_map
+
     def _get_gguf_weights_map(self, model_config: ModelConfig):
         """
         GGUF uses this naming convention for their tensors from HF checkpoint:
@@ -2058,6 +2142,8 @@ class GGUFModelLoader(BaseModelLoader):
             model_type = "qwen35moe"
         elif model_type in ("qwen3_5", "qwen3_5_text"):
             model_type = "qwen35"
+        elif model_type == "deepseek_v4":
+            return self._get_deepseek4_gguf_weights_map(config)
         strip_qwen35_model_prefix = model_type in ("qwen35moe", "qwen35")
         arch = None
         for key, value in gguf.MODEL_ARCH_NAMES.items():

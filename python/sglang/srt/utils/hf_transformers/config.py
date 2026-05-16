@@ -51,6 +51,143 @@ def _apply_deepseek_ocr_overrides(config, model):
     config._name_or_path = model
 
 
+def _gguf_field_value(reader, key: str, default=None):
+    field = reader.fields.get(key)
+    if field is None:
+        return default
+
+    values = []
+    for index in field.data:
+        value = field.parts[index]
+        if isinstance(value, bytes):
+            values.append(value.decode("utf-8"))
+        elif hasattr(value, "dtype"):
+            if str(value.dtype) == "uint8" and getattr(value, "ndim", 0) == 1:
+                values.append(bytes(value).decode("utf-8"))
+            elif getattr(value, "shape", ()) == (1,):
+                values.append(value.item())
+            else:
+                values.append(value.tolist())
+        else:
+            values.append(value)
+
+    if len(values) == 1:
+        return values[0]
+    return values
+
+
+def _synthesize_deepseek_v4_gguf_config(gguf_file: str):
+    import gguf
+
+    from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+
+    reader = gguf.GGUFReader(gguf_file)
+
+    def get(name: str, default=None):
+        return _gguf_field_value(reader, name, default)
+
+    def scalar(name: str, default=None):
+        value = get(name, default)
+        if isinstance(value, list):
+            return value[0] if value else default
+        return value
+
+    block_count = int(scalar("deepseek4.block_count", 43))
+    rope_dim = int(scalar("deepseek4.rope.dimension_count", 64))
+    head_dim = int(scalar("deepseek4.attention.key_length", 512))
+    compress_ratios = get("deepseek4.attention.compress_ratios", None)
+    if compress_ratios is None:
+        compress_ratios = [
+            0 if i < 2 else (4 if i % 2 == 0 else 128)
+            for i in range(block_count)
+        ]
+    compress_ratios = [int(x) for x in compress_ratios[:block_count]]
+    if len(compress_ratios) != block_count:
+        raise ValueError(
+            "DeepSeek V4 GGUF compress ratios length "
+            f"{len(compress_ratios)} does not match block_count={block_count}"
+        )
+
+    rope_scaling_type = scalar("deepseek4.rope.scaling.type", "yarn")
+    rope_scaling = {
+        "type": rope_scaling_type,
+        "rope_type": rope_scaling_type,
+        "factor": float(scalar("deepseek4.rope.scaling.factor", 16.0)),
+        "original_max_position_embeddings": int(
+            scalar("deepseek4.rope.scaling.original_context_length", 65536)
+        ),
+        "beta_fast": float(scalar("deepseek4.rope.scaling.yarn_beta_fast", 32.0)),
+        "beta_slow": float(scalar("deepseek4.rope.scaling.yarn_beta_slow", 1.0)),
+    }
+
+    config = DeepSeekV4Config(
+        architectures=["DeepseekV4ForCausalLM"],
+        hidden_size=int(scalar("deepseek4.embedding_length", 4096)),
+        vocab_size=int(scalar("deepseek4.vocab_size", 129280)),
+        max_position_embeddings=int(scalar("deepseek4.context_length", 1048576)),
+        num_hidden_layers=block_count,
+        n_routed_experts=int(scalar("deepseek4.expert_count", 256)),
+        num_experts_per_tok=int(scalar("deepseek4.expert_used_count", 6)),
+        n_shared_experts=int(scalar("deepseek4.expert_shared_count", 1)),
+        moe_intermediate_size=int(
+            scalar("deepseek4.expert_feed_forward_length", 2048)
+        ),
+        intermediate_size=int(scalar("deepseek4.expert_feed_forward_length", 2048)),
+        num_attention_heads=int(scalar("deepseek4.attention.head_count", 64)),
+        num_key_value_heads=int(scalar("deepseek4.attention.head_count_kv", 1)),
+        q_lora_rank=int(scalar("deepseek4.attention.q_lora_rank", 1024)),
+        kv_lora_rank=head_dim,
+        v_head_dim=int(scalar("deepseek4.attention.value_length", head_dim)),
+        qk_nope_head_dim=head_dim - rope_dim,
+        qk_rope_head_dim=rope_dim,
+        o_lora_rank=int(scalar("deepseek4.attention.output_lora_rank", 1024)),
+        o_groups=int(scalar("deepseek4.attention.output_group_count", 8)),
+        window_size=int(scalar("deepseek4.attention.sliding_window", 128)),
+        index_n_heads=int(scalar("deepseek4.attention.indexer.head_count", 64)),
+        index_head_dim=int(scalar("deepseek4.attention.indexer.key_length", 128)),
+        index_topk=int(scalar("deepseek4.attention.indexer.top_k", 512)),
+        rms_norm_eps=float(
+            scalar("deepseek4.attention.layer_norm_rms_epsilon", 1e-6)
+        ),
+        rope_theta=float(scalar("deepseek4.rope.freq_base", 10000.0)),
+        compress_rope_theta=float(
+            scalar("deepseek4.attention.compress_rope_freq_base", 160000.0)
+        ),
+        rope_scaling=rope_scaling,
+        compress_ratios=compress_ratios,
+        quantization_config={},
+        n_hash_layers=int(scalar("deepseek4.hash_layer_count", 3)),
+        hc_mult=int(scalar("deepseek4.hyper_connection.count", 4)),
+        hc_sinkhorn_iters=int(
+            scalar("deepseek4.hyper_connection.sinkhorn_iterations", 20)
+        ),
+        hc_eps=float(scalar("deepseek4.hyper_connection.epsilon", 1e-6)),
+        routed_scaling_factor=float(scalar("deepseek4.expert_weights_scale", 1.5)),
+        scoring_func="sqrtsoftplus",
+        topk_group=int(scalar("deepseek4.attention.output_group_count", 8)),
+        n_group=int(scalar("deepseek4.attention.output_group_count", 8)),
+        bos_token_id=int(scalar("tokenizer.ggml.bos_token_id", 0)),
+        eos_token_id=int(scalar("tokenizer.ggml.eos_token_id", 1)),
+        tie_word_embeddings=False,
+    )
+    config.head_dim = head_dim
+    config.sliding_window = config.window_size
+    config.num_hash_layers = config.n_hash_layers
+    config.swiglu_limit = float(scalar("deepseek4.swiglu_clamp_exp", 10.0))
+    config._name_or_path = str(Path(gguf_file).parent)
+    return config
+
+
+def _try_synthesize_gguf_config(gguf_file: str):
+    import gguf
+
+    reader = gguf.GGUFReader(gguf_file)
+    arch = _gguf_field_value(reader, "general.architecture")
+    if arch == "deepseek4":
+        return _synthesize_deepseek_v4_gguf_config(gguf_file)
+    return None
+
+
 @register_model_config_parser("hf")
 class HfModelConfigParser(ModelConfigParserBase):
     def parse(
@@ -196,6 +333,11 @@ def get_config(
                 "with GGUF inputs; only 'hf' (or 'auto') is supported."
             )
         _ensure_gguf_version()
+        config = _try_synthesize_gguf_config(str(model))
+        if config is not None:
+            if model_override_args:
+                config.update(model_override_args)
+            return config
         kwargs["gguf_file"] = model
         model = Path(model).parent
         # Skip auto-resolution for GGUF: the name-based Mistral heuristic

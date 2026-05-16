@@ -1208,6 +1208,7 @@ def gguf_quant_weights_iterator(
 
     arch = get_string_field("general.architecture")
     is_qwen35 = arch in ("qwen35", "qwen35moe")
+    is_deepseek4 = arch == "deepseek4"
     num_k_heads = get_scalar_field(".ssm.group_count")
     num_v_heads = get_scalar_field(".ssm.time_step_rank")
     head_k_dim = get_scalar_field(".ssm.state_size")
@@ -1332,6 +1333,46 @@ def gguf_quant_weights_iterator(
             return inverse_reorder_v_head_columns(param, weight_type)
         return param
 
+    def is_deepseek4_direct_tensor(name: str) -> bool:
+        if not is_deepseek4:
+            return False
+        if name.endswith(
+            (
+                ".attn_sink",
+                ".topk.tid2eid",
+                ".gate.e_score_correction_bias",
+                ".self_attn.wo_a.weight",
+                ".self_attn.indexer.weights_proj.weight",
+                ".mlp.gate.weight",
+                ".input_layernorm.weight",
+                ".post_attention_layernorm.weight",
+                ".self_attn.q_norm.weight",
+                ".self_attn.kv_norm.weight",
+                ".compressor.ape",
+                ".compressor.norm.weight",
+                ".compressor.wkv.weight",
+                ".compressor.wgate.weight",
+                ".hc_attn_fn",
+                ".hc_attn_base",
+                ".hc_attn_scale",
+                ".hc_ffn_fn",
+                ".hc_ffn_base",
+                ".hc_ffn_scale",
+                ".hc_head_fn",
+                ".hc_head_base",
+                ".hc_head_scale",
+            )
+        ):
+            return True
+        return False
+
+    def tensor_to_torch(tensor, direct: bool = False) -> torch.Tensor:
+        weight_type = tensor.tensor_type
+        if direct and weight_type.name not in ("F32", "F16", "BF16", "I32"):
+            param = gguf.dequantize(tensor.data, weight_type)
+            return torch.from_numpy(param)
+        return torch.tensor(tensor.data)
+
     # MoE expert weight name patterns
     MOE_WEIGHT_PATTERNS = {
         "ffn_gate_exps": "gate_proj",  # gate projection
@@ -1376,7 +1417,10 @@ def gguf_quant_weights_iterator(
             # Normal weight handling
             name = gguf_to_hf_name_map[tensor_name]
 
-            if weight_type.name != "F32":
+            if (
+                weight_type.name != "F32"
+                and not is_deepseek4_direct_tensor(name)
+            ):
                 weight_type_name = name.replace("weight", "qweight_type")
                 yield weight_type_name, torch.tensor(weight_type)
 
@@ -1416,10 +1460,11 @@ def gguf_quant_weights_iterator(
         elif tensor_name in gguf_to_hf_name_map:
             # Normal weight handling
             name = gguf_to_hf_name_map[tensor_name]
+            is_direct = is_deepseek4_direct_tensor(name)
 
-            if weight_type.name != "F32":
+            if weight_type.name != "F32" and not is_direct:
                 name = name.replace("weight", "qweight")
-            param = torch.tensor(weight)
+            param = tensor_to_torch(tensor, direct=is_direct)
             if tensor_name.endswith(".ssm_a") and name.endswith(".linear_attn.A_log"):
                 # llama.cpp stores the already-negative decay as ssm_a, while
                 # SGLang GDN kernels expect HF-style A_log and apply -exp(A_log).
