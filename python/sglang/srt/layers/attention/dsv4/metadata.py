@@ -99,11 +99,13 @@ class PagedIndexerMetadata:
     page_size: int
     page_table: torch.Tensor
     c4_seq_lens: torch.Tensor
+    force_torch_logits: bool = False
+    force_torch_topk: bool = False
     deep_gemm_metadata: Any = field(init=False, repr=False)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self):
-        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+        if self.force_torch_logits or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             self.deep_gemm_metadata = None
         else:
             import deep_gemm
@@ -126,7 +128,9 @@ class PagedIndexerMetadata:
 
         from sglang.jit_kernel.deepseek_v4 import plan_topk_v2
 
-        if envs.SGLANG_OPT_USE_TOPK_V2.get():
+        if self.force_torch_topk:
+            self.topk_metadata = torch.empty((0,))
+        elif envs.SGLANG_OPT_USE_TOPK_V2.get():
             self.topk_metadata = plan_topk_v2(self.c4_seq_lens)
         else:
             self.topk_metadata = torch.empty((0,))
@@ -154,7 +158,7 @@ class PagedIndexerMetadata:
         copy_metadata(
             src=other,
             dst=self,
-            check_eq_fields=["page_size"],
+            check_eq_fields=["page_size", "force_torch_logits", "force_torch_topk"],
             copy_fields=copy_fields,
         )
 

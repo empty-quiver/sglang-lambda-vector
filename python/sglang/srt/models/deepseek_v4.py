@@ -439,9 +439,7 @@ class MQALayer(nn.Module):
         q_lora = self._compute_q_a(x, qkv_a=qkv_a)
         q_lora_ready = current_stream.record_event()
 
-        if self.indexer is not None and not getattr(
-            attn_backend, "use_torch_fallback", False
-        ):
+        if self.indexer is not None:
             with torch.cuda.stream(stream_indexer):
                 self.indexer(
                     x=x,
@@ -459,9 +457,7 @@ class MQALayer(nn.Module):
 
         del qkv_a
 
-        if self.compressor is not None and not getattr(
-            attn_backend, "use_torch_fallback", False
-        ):
+        if self.compressor is not None:
             with torch.cuda.stream(stream_compressor):
                 attn_backend.forward_core_compressor(
                     x, forward_batch, self.layer_id, self.compressor
@@ -514,13 +510,9 @@ class MQALayer(nn.Module):
 
         del qkv_a
 
-        if self.indexer is not None and not getattr(
-            attn_backend, "use_torch_fallback", False
-        ):
+        if self.indexer is not None:
             self.indexer(x=x, q_lora=q_lora, forward_batch=forward_batch)
-        if self.compressor is not None and not getattr(
-            attn_backend, "use_torch_fallback", False
-        ):
+        if self.compressor is not None:
             attn_backend.forward_core_compressor(
                 x,
                 forward_batch,

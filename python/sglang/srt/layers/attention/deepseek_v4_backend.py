@@ -555,6 +555,8 @@ class DeepseekV4AttnBackend(
             page_size=self.page_size,
             page_table=core_attn_metadata.page_table,
             c4_seq_lens=core_attn_metadata.c4_topk_lengths_raw,
+            force_torch_logits=self.use_torch_fallback,
+            force_torch_topk=self.use_torch_fallback,
         )
 
     def init_forward_metadata_decode(
@@ -575,7 +577,7 @@ class DeepseekV4AttnBackend(
                 out_cache_loc=out_cache_loc,
             )
 
-        need_compress = not self.use_torch_fallback
+        need_compress = True
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices,
@@ -622,7 +624,6 @@ class DeepseekV4AttnBackend(
         need_compress: bool = True,
         use_prefill_cuda_graph: bool = False,
     ) -> DSV4Metadata:
-        need_compress = need_compress and not self.use_torch_fallback
         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
             num_tokens=num_tokens,
             seq_lens=seq_lens_cpu,

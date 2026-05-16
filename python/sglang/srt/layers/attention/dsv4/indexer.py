@@ -373,17 +373,21 @@ class C4IndexerBackendMixin:
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
-        if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+        use_torch_logits = (
+            indexer_metadata.force_torch_logits
+            or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+        )
+        if use_torch_logits:
+            fn = fp8_paged_mqa_logits_torch
+        elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
             from sglang.srt.layers.attention.dsv4.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
-        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
-            fn = fp8_paged_mqa_logits_torch
         else:
             from deep_gemm import fp8_paged_mqa_logits as fn
 
         _c4sl = indexer_metadata.c4_seq_lens
-        if _c4sl.dim() == 1:
+        if _c4sl.dim() == 1 and not use_torch_logits:
             _c4sl = _c4sl.unsqueeze(-1)
         logits = fn(
             q_fp8,
@@ -416,7 +420,10 @@ class C4IndexerBackendMixin:
                 : core_metadata.c4_sparse_page_indices.size(0)
             ]
 
-        if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
+        if (
+            indexer_metadata.force_torch_topk
+            or envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
+        ):
             topk_transform_512_pytorch_vectorized(
                 logits,
                 indexer_metadata.c4_seq_lens,
