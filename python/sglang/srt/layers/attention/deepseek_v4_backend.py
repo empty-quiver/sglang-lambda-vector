@@ -101,6 +101,7 @@ def _create_flashmla_metadata():
 
 
 _TORCH_FALLBACK_WARNED = False
+_TORCH_FALLBACK_SWA_ONLY_WARNED = False
 _ATTN_FIXTURE_DUMP_COUNT = 0
 
 
@@ -1145,13 +1146,25 @@ class DeepseekV4AttnBackend(
 
             extra_k_cache, extra_indices, extra_topk_lengths = None, None, None
             if compress_ratio == 4:
-                extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
                 extra_indices = core_attn_metadata.c4_sparse_page_indices
                 extra_topk_lengths = core_attn_metadata.c4_sparse_topk_lengths
             elif compress_ratio == 128:
-                extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
                 extra_indices = core_attn_metadata.c128_page_indices
                 extra_topk_lengths = core_attn_metadata.c128_topk_lengths_clamp1
+
+            if extra_indices is not None:
+                extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
+            elif compress_ratio != 0 and self.use_torch_fallback:
+                global _TORCH_FALLBACK_SWA_ONLY_WARNED
+                if not _TORCH_FALLBACK_SWA_ONLY_WARNED:
+                    logger.warning(
+                        "flash_mla is not installed; DeepSeek V4 torch "
+                        "fallback is using SWA-only attention for compressed "
+                        "layers because compressor metadata is disabled in "
+                        "fallback mode. This is intended for short smoke tests "
+                        "only."
+                    )
+                    _TORCH_FALLBACK_SWA_ONLY_WARNED = True
 
             swa_window_size = token_to_kv_pool.swa_window_size
             assert swa_k_cache.ndim == 2
