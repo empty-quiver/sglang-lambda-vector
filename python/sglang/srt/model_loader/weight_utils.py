@@ -1188,12 +1188,161 @@ def gguf_quant_weights_iterator(
 
     reader = gguf.GGUFReader(gguf_file)
 
+    def get_string_field(suffix: str) -> Optional[str]:
+        for key, field in reader.fields.items():
+            if key.endswith(suffix):
+                value = field.parts[field.data[0]]
+                if isinstance(value, bytes):
+                    return value.decode("utf-8")
+                if hasattr(value, "dtype") and str(value.dtype) == "uint8":
+                    return bytes(value).decode("utf-8")
+                return str(value)
+        return None
+
+    def get_scalar_field(suffix: str) -> Optional[int]:
+        for key, field in reader.fields.items():
+            if key.endswith(suffix):
+                value = field.parts[field.data[0]]
+                return int(value[0])
+        return None
+
+    arch = get_string_field("general.architecture")
+    is_qwen35 = arch in ("qwen35", "qwen35moe")
+    num_k_heads = get_scalar_field(".ssm.group_count")
+    num_v_heads = get_scalar_field(".ssm.time_step_rank")
+    head_k_dim = get_scalar_field(".ssm.state_size")
+    ssm_inner_size = get_scalar_field(".ssm.inner_size")
+    head_v_dim = (
+        ssm_inner_size // num_v_heads
+        if ssm_inner_size is not None and num_v_heads
+        else None
+    )
+    restore_qwen35_v_head_order = (
+        os.getenv("SGLANG_GGUF_RESTORE_QWEN35_V_HEAD_ORDER", "1") != "0"
+    )
+    has_tiled_v_heads = (
+        restore_qwen35_v_head_order
+        and
+        num_k_heads is not None
+        and num_v_heads is not None
+        and head_k_dim is not None
+        and head_v_dim is not None
+        and num_k_heads > 0
+        and num_v_heads > 0
+        and num_v_heads != num_k_heads
+    )
+
+    def inverse_reorder_v_heads(
+        tensor: torch.Tensor,
+        dim: int,
+        head_dim: int,
+    ) -> torch.Tensor:
+        assert num_k_heads is not None
+        assert num_v_heads is not None
+        num_v_per_k = num_v_heads // num_k_heads
+        if dim < 0:
+            dim += tensor.ndim
+        expected_size = num_v_heads * head_dim
+        if tensor.shape[dim] != expected_size:
+            raise ValueError(
+                "Unexpected Qwen3.5 GGUF value-head dimension "
+                f"{tensor.shape[dim]} for tensor shape {tuple(tensor.shape)}; "
+                f"expected {expected_size}."
+            )
+        shape = list(tensor.shape)
+        new_shape = (
+            shape[:dim] + [num_v_per_k, num_k_heads, head_dim] + shape[dim + 1 :]
+        )
+        tensor = tensor.reshape(*new_shape)
+        perm = list(range(tensor.ndim))
+        perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
+        return tensor.permute(*perm).contiguous().reshape(*shape)
+
+    def inverse_reorder_v_head_columns(
+        tensor: torch.Tensor,
+        weight_type,
+    ) -> torch.Tensor:
+        assert head_v_dim is not None
+        assert num_k_heads is not None
+        assert num_v_heads is not None
+        if weight_type.name in ("F32", "F16", "BF16"):
+            packed_head_dim = head_v_dim
+        else:
+            block_size, type_size = gguf.GGML_QUANT_SIZES[weight_type]
+            if head_v_dim % block_size != 0:
+                raise ValueError(
+                    "Cannot inverse-reorder packed Qwen3.5 out_proj columns for "
+                    f"{weight_type.name}: head_v_dim={head_v_dim} is not divisible "
+                    f"by GGUF block_size={block_size}."
+                )
+            packed_head_dim = head_v_dim // block_size * type_size
+
+        expected_size = num_v_heads * packed_head_dim
+        if tensor.shape[1] != expected_size:
+            raise ValueError(
+                "Unexpected Qwen3.5 GGUF out_proj packed input dimension "
+                f"{tensor.shape[1]} for tensor shape {tuple(tensor.shape)}; "
+                f"expected {expected_size}."
+            )
+        num_v_per_k = num_v_heads // num_k_heads
+        return (
+            tensor.reshape(tensor.shape[0], num_v_per_k, num_k_heads, packed_head_dim)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .reshape(tensor.shape)
+        )
+
+    def maybe_restore_qwen35_v_head_order(
+        tensor_name: str,
+        name: str,
+        param: torch.Tensor,
+        weight_type,
+    ) -> torch.Tensor:
+        # llama.cpp stores Qwen3.5 linear-attention value heads in tiled GGML
+        # order. SGLang kernels consume the original HF grouped order.
+        if not has_tiled_v_heads or ".linear_attn." not in name:
+            return param
+
+        assert head_k_dim is not None
+        assert head_v_dim is not None
+        qk_dim = num_k_heads * head_k_dim
+        value_dim = num_v_heads * head_v_dim
+
+        if tensor_name.endswith(".attn_qkv.weight"):
+            q = param[:qk_dim]
+            k = param[qk_dim : 2 * qk_dim]
+            v = inverse_reorder_v_heads(param[2 * qk_dim :], 0, head_v_dim)
+            return torch.cat((q, k, v), dim=0)
+        if tensor_name.endswith(".attn_gate.weight"):
+            return inverse_reorder_v_heads(param, 0, head_v_dim)
+        if tensor_name.endswith(".ssm_alpha.weight") or tensor_name.endswith(
+            ".ssm_beta.weight"
+        ):
+            return inverse_reorder_v_heads(param, 0, 1)
+        if tensor_name.endswith(".ssm_a") or tensor_name.endswith(".ssm_dt.bias"):
+            return inverse_reorder_v_heads(param, 0, 1)
+        if tensor_name.endswith(".ssm_conv1d.weight"):
+            qk_channels = 2 * qk_dim
+            qk_part = param[:qk_channels]
+            v_part = inverse_reorder_v_heads(param[qk_channels:], 0, head_v_dim)
+            return torch.cat((qk_part, v_part), dim=0)
+        if tensor_name.endswith(".ssm_out.weight"):
+            if param.shape[0] == value_dim:
+                return inverse_reorder_v_heads(param, 0, head_v_dim)
+            return inverse_reorder_v_head_columns(param, weight_type)
+        return param
+
     # MoE expert weight name patterns
     MOE_WEIGHT_PATTERNS = {
         "ffn_gate_exps": "gate_proj",  # gate projection
         "ffn_up_exps": "up_proj",  # up projection
         "ffn_down_exps": "down_proj",  # down projection
     }
+    moe_layer_prefix = (
+        "layers"
+        if any(name.startswith("layers.") for name in gguf_to_hf_name_map.values())
+        else "model.layers"
+    )
 
     # First pass: yield weight types
     for tensor in reader.tensors:
@@ -1221,7 +1370,7 @@ def gguf_quant_weights_iterator(
                     weight = tensor.data
                     num_experts = weight.shape[0]
                     for expert_id in range(num_experts):
-                        hf_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.qweight_type"
+                        hf_name = f"{moe_layer_prefix}.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.qweight_type"
                         yield hf_name, torch.tensor(weight_type)
         elif tensor_name in gguf_to_hf_name_map:
             # Normal weight handling
@@ -1259,9 +1408,9 @@ def gguf_quant_weights_iterator(
                         expert_weight = weight[expert_id]
 
                         if weight_type.name != "F32":
-                            hf_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.qweight"
+                            hf_name = f"{moe_layer_prefix}.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.qweight"
                         else:
-                            hf_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.weight"
+                            hf_name = f"{moe_layer_prefix}.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.weight"
 
                         yield hf_name, torch.tensor(expert_weight)
         elif tensor_name in gguf_to_hf_name_map:
@@ -1271,6 +1420,28 @@ def gguf_quant_weights_iterator(
             if weight_type.name != "F32":
                 name = name.replace("weight", "qweight")
             param = torch.tensor(weight)
+            if tensor_name.endswith(".ssm_a") and name.endswith(".linear_attn.A_log"):
+                # llama.cpp stores the already-negative decay as ssm_a, while
+                # SGLang GDN kernels expect HF-style A_log and apply -exp(A_log).
+                param = torch.log(
+                    (-param.to(torch.float32)).clamp_min(
+                        torch.finfo(torch.float32).tiny
+                    )
+                )
+            elif (
+                is_qwen35
+                and tensor_name.endswith("norm.weight")
+                and not tensor_name.endswith(".ssm_norm.weight")
+            ):
+                # llama.cpp converts Qwen3.5 Gemma-style RMSNorm weights to the
+                # effective scale by adding 1 before writing GGUF. SGLang's
+                # GemmaRMSNorm applies that +1 at runtime, so restore the HF
+                # parameter value here. The GDN gated norm (`ssm_norm`) uses the
+                # raw weight directly and must not be adjusted.
+                param = param.to(torch.float32) - 1.0
+            param = maybe_restore_qwen35_v_head_order(
+                tensor_name, name, param, weight_type
+            )
             yield name, param
 
 

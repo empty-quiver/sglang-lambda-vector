@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     HostPoolGroup,
     MambaPoolHost,
     MHATokenToKVPoolHost,
+    MHATokenToKVPoolHostFP4,
     MLATokenToKVPoolHost,
     NSAIndexerPoolHost,
     PoolEntry,
@@ -52,6 +53,8 @@ def build_kv_host_pool(
     kwargs = {}
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
+    if not use_mla and hasattr(kv_pool, "k_scale_buffer"):
+        kv_host_pool_cls = MHATokenToKVPoolHostFP4
     return kv_host_pool_cls(
         kv_pool,
         server_args.hicache_ratio,

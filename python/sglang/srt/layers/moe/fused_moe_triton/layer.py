@@ -703,8 +703,12 @@ class FusedMoE(torch.nn.Module):
         is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
 
         if is_gguf_weight_type:
-            # Store weight type for this expert
-            param.weight_type = loaded_weight.item()
+            weight_type = int(loaded_weight.item())
+            if not hasattr(param, "expert_shard_weight_type"):
+                param.expert_shard_weight_type = {}
+            param.expert_shard_weight_type[(expert_id, shard_id)] = weight_type
+            if getattr(param, "weight_type", 0) == 0:
+                param.weight_type = weight_type
             return True
 
         if is_gguf_weight:
@@ -1210,6 +1214,47 @@ class FusedMoE(torch.nn.Module):
         This materializes GGUF UninitializedParameters from their data_containers.
         """
 
+        def validate_gguf_moe_qtypes(
+            qtype_param: torch.nn.Parameter,
+            expert_weights: dict,
+            required_shards: tuple[str, ...],
+            fused_name: str,
+        ) -> None:
+            qtype_map = getattr(qtype_param, "expert_shard_weight_type", {})
+            if not qtype_map:
+                return
+
+            found_qtypes = {}
+            missing_qtypes = []
+            for expert_id, shard_weights in expert_weights.items():
+                if not all(shard in shard_weights for shard in required_shards):
+                    continue
+                for shard in required_shards:
+                    qtype = qtype_map.get((expert_id, shard))
+                    if qtype is None:
+                        missing_qtypes.append((expert_id, shard))
+                    else:
+                        found_qtypes.setdefault(qtype, []).append((expert_id, shard))
+
+            if missing_qtypes:
+                raise ValueError(
+                    "Missing GGUF MoE qweight_type entries for "
+                    f"{fused_name}: {missing_qtypes[:8]}"
+                )
+
+            if len(found_qtypes) > 1:
+                summary = {
+                    qtype: entries[:8] for qtype, entries in sorted(found_qtypes.items())
+                }
+                raise ValueError(
+                    "Unsupported mixed GGUF MoE qtypes for fused "
+                    f"{fused_name}: {summary}. SGLang GGUF MoE kernels currently "
+                    "use one qtype for the whole fused tensor."
+                )
+
+            if found_qtypes:
+                qtype_param.weight_type = next(iter(found_qtypes))
+
         for name, param in list(self.named_parameters()):
             is_gguf_weight = getattr(param, "is_gguf_weight", False)
 
@@ -1231,6 +1276,12 @@ class FusedMoE(torch.nn.Module):
 
                     # Build the full tensor
                     if "w13" in name:
+                        validate_gguf_moe_qtypes(
+                            qtype_param=self.w13_qweight_type,
+                            expert_weights=expert_weights,
+                            required_shards=("w1", "w3"),
+                            fused_name=name,
+                        )
                         # w13 is gate+up fused
                         weight_list = []
                         for e in range(num_experts):
@@ -1247,6 +1298,12 @@ class FusedMoE(torch.nn.Module):
                             param.materialize(stacked.shape, dtype=stacked.dtype)
                             param.data.copy_(stacked)
                     elif "w2" in name:
+                        validate_gguf_moe_qtypes(
+                            qtype_param=self.w2_qweight_type,
+                            expert_weights=expert_weights,
+                            required_shards=("w2",),
+                            fused_name=name,
+                        )
                         # w2 is down projection
                         weight_list = []
                         for e in range(num_experts):

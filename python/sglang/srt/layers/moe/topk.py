@@ -354,6 +354,14 @@ class TopK(MultiPlatformOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
+        if expert_location_dispatch_info is not None:
+            return self.forward_cuda(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+            )
+
         self.topk_config.torch_native = True
         topk_output = select_experts(
             hidden_states=hidden_states,

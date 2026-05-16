@@ -207,8 +207,12 @@ class ModelConfig:
             **kwargs,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        generation_config_path = self.model_path
+        model_path_obj = Path(self.model_path)
+        if model_path_obj.is_file() and model_path_obj.suffix.lower() == ".gguf":
+            generation_config_path = str(model_path_obj.parent)
         self.hf_generation_config = get_generation_config(
-            self.model_path,
+            generation_config_path,
             trust_remote_code=trust_remote_code,
             revision=revision,
             **kwargs,

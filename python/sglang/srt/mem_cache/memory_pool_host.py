@@ -785,6 +785,272 @@ class MHATokenToKVPoolHost(HostKVCache):
         return ptr_list, element_size_list
 
 
+class MHATokenToKVPoolHostFP4(HostKVCache):
+    device_pool: MHATokenToKVPool
+
+    def __init__(
+        self,
+        device_pool: MHATokenToKVPool,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        pin_memory: bool = True,
+        device: str = "cpu",
+        allocator_type: str = "default",
+    ):
+        super().__init__(
+            device_pool,
+            host_to_device_ratio,
+            host_size,
+            page_size,
+            layout,
+            pin_memory,
+            device,
+            allocator_type,
+        )
+        self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
+        self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
+        self.k_scale_data_refs = [
+            self.k_scale_buffer[i] for i in range(self.layer_num)
+        ]
+        self.v_scale_data_refs = [
+            self.v_scale_buffer[i] for i in range(self.layer_num)
+        ]
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+        self.k_scale_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_scale_data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+        self.v_scale_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_scale_data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+
+    def get_size_per_token(self):
+        self.layer_num = self.device_pool.layer_num
+        self.k_shape = tuple(self.device_pool.k_buffer[0].shape[1:])
+        self.v_shape = tuple(self.device_pool.v_buffer[0].shape[1:])
+        self.k_scale_shape = tuple(self.device_pool.k_scale_buffer[0].shape[1:])
+        self.v_scale_shape = tuple(self.device_pool.v_scale_buffer[0].shape[1:])
+        self.k_item_dim = int(np.prod(self.k_shape))
+        self.v_item_dim = int(np.prod(self.v_shape))
+        self.k_scale_item_dim = int(np.prod(self.k_scale_shape))
+        self.v_scale_item_dim = int(np.prod(self.v_scale_shape))
+        return (
+            self.layer_num
+            * (
+                self.k_item_dim
+                + self.v_item_dim
+                + self.k_scale_item_dim
+                + self.v_scale_item_dim
+            )
+            * self.dtype.itemsize
+        )
+
+    def get_ksize_per_token(self):
+        return (
+            self.layer_num
+            * (self.k_item_dim + self.k_scale_item_dim)
+            * self.dtype.itemsize
+        )
+
+    def init_kv_buffer(self):
+        if self.layout != "layer_first":
+            raise ValueError(
+                f"FP4 HiCache only supports layer_first layout, got {self.layout}"
+            )
+
+        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+
+        def alloc(dims):
+            return alloc_func(
+                dims,
+                dtype=self.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
+
+        return {
+            "k": alloc((self.layer_num, self.size, *self.k_shape)),
+            "v": alloc((self.layer_num, self.size, *self.v_shape)),
+            "k_scale": alloc((self.layer_num, self.size, *self.k_scale_shape)),
+            "v_scale": alloc((self.layer_num, self.size, *self.v_scale_shape)),
+        }
+
+    @property
+    def k_buffer(self):
+        return self.kv_buffer["k"]
+
+    @property
+    def v_buffer(self):
+        return self.kv_buffer["v"]
+
+    @property
+    def k_scale_buffer(self):
+        return self.kv_buffer["k_scale"]
+
+    @property
+    def v_scale_buffer(self):
+        return self.kv_buffer["v_scale"]
+
+    def load_to_device_per_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+    ):
+        if io_backend == "kernel":
+            transfer_kv_per_layer(
+                src_k=self.k_buffer[layer_id],
+                dst_k=device_pool.k_buffer[layer_id],
+                src_v=self.v_buffer[layer_id],
+                dst_v=device_pool.v_buffer[layer_id],
+                src_indices=host_indices,
+                dst_indices=device_indices,
+                item_size=self.k_item_dim * self.dtype.itemsize,
+            )
+            transfer_kv_per_layer(
+                src_k=self.k_scale_buffer[layer_id],
+                dst_k=device_pool.k_scale_buffer[layer_id],
+                src_v=self.v_scale_buffer[layer_id],
+                dst_v=device_pool.v_scale_buffer[layer_id],
+                src_indices=host_indices,
+                dst_indices=device_indices,
+                item_size=self.k_scale_item_dim * self.dtype.itemsize,
+            )
+        elif io_backend == "direct":
+            transfer_kv_direct(
+                src_layers=[
+                    self.k_buffer[layer_id],
+                    self.v_buffer[layer_id],
+                    self.k_scale_buffer[layer_id],
+                    self.v_scale_buffer[layer_id],
+                ],
+                dst_layers=[
+                    device_pool.k_buffer[layer_id],
+                    device_pool.v_buffer[layer_id],
+                    device_pool.k_scale_buffer[layer_id],
+                    device_pool.v_scale_buffer[layer_id],
+                ],
+                src_indices=host_indices,
+                dst_indices=device_indices,
+                page_size=self.page_size,
+            )
+        else:
+            raise ValueError(f"Unsupported IO backend for FP4 HiCache: {io_backend}")
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        if io_backend == "kernel":
+            transfer_kv_all_layer(
+                src_k_layers=device_pool.k_data_ptrs,
+                dst_k_layers=self.k_data_ptrs,
+                src_v_layers=device_pool.v_data_ptrs,
+                dst_v_layers=self.v_data_ptrs,
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                item_size=self.k_item_dim * self.dtype.itemsize,
+                num_layers=self.layer_num,
+            )
+            transfer_kv_all_layer(
+                src_k_layers=device_pool.k_scale_data_ptrs,
+                dst_k_layers=self.k_scale_data_ptrs,
+                src_v_layers=device_pool.v_scale_data_ptrs,
+                dst_v_layers=self.v_scale_data_ptrs,
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                item_size=self.k_scale_item_dim * self.dtype.itemsize,
+                num_layers=self.layer_num,
+            )
+        elif io_backend == "direct":
+            transfer_kv_direct(
+                src_layers=(
+                    device_pool.k_buffer
+                    + device_pool.v_buffer
+                    + device_pool.k_scale_buffer
+                    + device_pool.v_scale_buffer
+                ),
+                dst_layers=(
+                    self.k_data_refs
+                    + self.v_data_refs
+                    + self.k_scale_data_refs
+                    + self.v_scale_data_refs
+                ),
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                page_size=self.page_size,
+            )
+        else:
+            raise ValueError(f"Unsupported IO backend for FP4 HiCache: {io_backend}")
+
+    def _iter_page_tensors(self, index: int):
+        return (
+            self.k_buffer[:, index : index + self.page_size],
+            self.v_buffer[:, index : index + self.page_size],
+            self.k_scale_buffer[:, index : index + self.page_size],
+            self.v_scale_buffer[:, index : index + self.page_size],
+        )
+
+    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        data_page = torch.cat(
+            [
+                tensor.contiguous().view(torch.uint8).flatten()
+                for tensor in self._iter_page_tensors(index)
+            ]
+        )
+        return data_page.flatten() if flat else data_page
+
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        return torch.zeros(
+            self.page_size * self.size_per_token,
+            dtype=torch.uint8,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
+
+    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        flat_bytes = data_page.contiguous().view(torch.uint8).reshape(-1)
+        start = 0
+        for tensor in self._iter_page_tensors(index):
+            num_bytes = tensor.numel() * tensor.element_size()
+            tensor_bytes = flat_bytes[start : start + num_bytes]
+            start += num_bytes
+            tensor.copy_(tensor_bytes.view(dtype=tensor.dtype).reshape(tensor.shape))
+
+    def get_page_buffer_meta(self, indices):
+        assert len(indices) % self.page_size == 0
+        ptr_list = []
+        element_size_list = []
+        for index in indices.tolist()[:: self.page_size]:
+            for layer_id in range(self.layer_num):
+                for tensor in (
+                    self.k_buffer[layer_id],
+                    self.v_buffer[layer_id],
+                    self.k_scale_buffer[layer_id],
+                    self.v_scale_buffer[layer_id],
+                ):
+                    page = tensor[index : index + self.page_size]
+                    ptr_list.append(page.data_ptr())
+                    element_size_list.append(page.numel() * page.element_size())
+        return ptr_list, element_size_list
+
+
 class MLATokenToKVPoolHost(HostKVCache):
     device_pool: MLATokenToKVPool
 

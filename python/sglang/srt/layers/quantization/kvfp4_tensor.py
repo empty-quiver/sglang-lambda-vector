@@ -149,6 +149,9 @@ class BlockFP4KVQuantizeUtil:
         return scaled.view(b, m, n).to(dtype)
 
 
+KVFP4QuantizeUtil = BlockFP4KVQuantizeUtil
+
+
 class NVFP4KVQuantizeUtil:
     """Utility class for NVFP4 quantization and dequantization with two-level scaling
     (global FP32 + block FP8 E4M3).

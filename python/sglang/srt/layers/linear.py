@@ -553,20 +553,16 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: tuple[int, ...] | int | None = None,
     ):
-        if isinstance(loaded_shard_id, tuple):
-            if hasattr(param, "load_merged_column_weight"):
-                return self.weight_loader_v2(param, loaded_weight, loaded_shard_id)
-            raise NotImplementedError(
-                "Shard id with multiple indices is not supported in weight_loader, "
-                "please use weight_loader_v2 instead."
-            )
-
         # Special case for GGUF
         # initialize GGUF param after we know the quantize type
         is_gguf_weight = getattr(param, "is_gguf_weight", False)
         is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
         if is_gguf_weight_type:
-            param.data[loaded_shard_id].copy_(loaded_weight)
+            if isinstance(loaded_shard_id, tuple):
+                shard_indices = list(loaded_shard_id)
+                param.data[shard_indices].copy_(loaded_weight.expand(len(shard_indices)))
+            else:
+                param.data[loaded_shard_id].copy_(loaded_weight)
             param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
             return
 
@@ -581,6 +577,14 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             param.shard_id_map[loaded_shard_id] = len(param.data_container)
             param.data_container.append(loaded_weight)
             return
+
+        if isinstance(loaded_shard_id, tuple):
+            if hasattr(param, "load_merged_column_weight"):
+                return self.weight_loader_v2(param, loaded_weight, loaded_shard_id)
+            raise NotImplementedError(
+                "Shard id with multiple indices is not supported in weight_loader, "
+                "please use weight_loader_v2 instead."
+            )
 
         param_data = param.data
         output_dim = getattr(param, "output_dim", None)

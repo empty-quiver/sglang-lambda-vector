@@ -26,6 +26,7 @@ static __device__ __forceinline__ void moe_q(
     const int* __restrict__ expert_ids,
     const int* __restrict__ num_tokens_post_padded,
     const int exp_stride,
+    const int num_experts,
     const int ncols_x,
     const int nrows_x,
     const int ncols_y,
@@ -43,14 +44,15 @@ static __device__ __forceinline__ void moe_q(
 
   const auto col_dst_0 = blockIdx.y * mmq_x;
 
+  if (blockIdx.y * mmq_x >= num_tokens_post_padded[0]) return;
+
   int token_offs[mmq_x / nwarps];
   for (int i = 0; i < mmq_x; i += nwarps) {
     token_offs[i / nwarps] = sorted_token_ids[col_dst_0 + threadIdx.y + i];
   }
 
   const int exp_idx = expert_ids[blockIdx.y];
-  if (exp_idx > 255 || exp_idx < 0) return;
-  if (blockIdx.y * mmq_x > num_tokens_post_padded[0]) return;
+  if (exp_idx < 0 || exp_idx >= num_experts) return;
 
   const block_q_t* x = (const block_q_t*)((char*)vx + exp_idx * exp_stride);
   const block_q8_1* y = (const block_q8_1*)(vy);
@@ -87,23 +89,27 @@ static __device__ __forceinline__ void moe_q(
 
 #pragma unroll
       for (int i = 0; i < mmq_x; i += nwarps) {
-        const int col_y_eff = token_offs[i / nwarps] / top_k;
+        const int token_off = token_offs[i / nwarps];
         const int block_x = ib0 * (qk / QK8_1) + kbxd;
-        if (col_y_eff < ncols_y && block_x < blocks_per_col_y) {
+        const int index_y = (threadIdx.y + i) * WARP_SIZE_GGUF + kqs % WARP_SIZE_GGUF;
+        if (token_off >= 0 && token_off < ncols_dst && block_x < blocks_per_col_y) {
+          const int col_y_eff = token_off / top_k;
           const block_q8_1* by0 = &y[col_y_eff * blocks_per_col_y + block_x];
-          const int index_y = (threadIdx.y + i) * WARP_SIZE_GGUF + kqs % WARP_SIZE_GGUF;
           tile_y_qs[index_y] = get_int_from_int8_aligned(by0->qs, threadIdx.x % QI8_1);
+        } else {
+          tile_y_qs[index_y] = 0;
         }
       }
 
       if (threadIdx.x < n_per_r / QK8_1) {
         const auto kby = threadIdx.x % (WARP_SIZE_GGUF / QI8_1);
-        const int col_y_eff = token_offs[threadIdx.y] / top_k;
+        const int token_off = token_offs[0];
         const int block_x = ib0 * (qk / QK8_1) + ir * (WARP_SIZE_GGUF / QI8_1) + kby;
+        half2* dsi_dst = &tile_y_ds[threadIdx.y * (WARP_SIZE_GGUF / QI8_1) + kby];
 
-        if (col_y_eff < ncols_y && block_x < blocks_per_col_y) {
+        if (token_off >= 0 && token_off < ncols_dst && block_x < blocks_per_col_y) {
+          const int col_y_eff = token_off / top_k;
           const half2* dsi_src = &y[col_y_eff * blocks_per_col_y + block_x].ds;
-          half2* dsi_dst = &tile_y_ds[threadIdx.y * (WARP_SIZE_GGUF / QI8_1) + kby];
 
           if (need_sum) {
             *dsi_dst = *dsi_src;
@@ -111,6 +117,11 @@ static __device__ __forceinline__ void moe_q(
             float* dfi_dst = (float*)dsi_dst;
             *dfi_dst = __low2float(*dsi_src);
           }
+        } else if (need_sum) {
+          *dsi_dst = __float2half2_rn(0.0f);
+        } else {
+          float* dfi_dst = (float*)dsi_dst;
+          *dfi_dst = 0.0f;
         }
       }
       __syncthreads();
@@ -133,8 +144,8 @@ static __device__ __forceinline__ void moe_q(
 #pragma unroll
   for (int j = 0; j < mmq_x; j += nwarps) {
     const int col_dst = token_offs[j / nwarps];
-    if (col_dst >= ncols_dst) {
-      return;
+    if (col_dst < 0 || col_dst >= ncols_dst) {
+      continue;
     }
 
 #pragma unroll
@@ -171,6 +182,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q4_0, 2)
         const int* expert_ids,
         const int* num_tokens_post_padded,
         const int exp_stride,
+        const int num_experts,
         const int ncols_x,
         const int nrows_x,
         const int ncols_y,
@@ -202,6 +214,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q4_0, 2)
       expert_ids,
       num_tokens_post_padded,
       exp_stride,
+      num_experts,
       ncols_x,
       nrows_x,
       ncols_y,
@@ -219,6 +232,7 @@ static void ggml_moe_q4_0_q8_1_cuda(
     const int* expert_ids,
     const int* num_tokens_post_padded,
     const int exp_stride,
+    const int num_experts,
     const int ncols_x,
     const int nrows_x,
     const int ncols_y,
@@ -246,6 +260,7 @@ static void ggml_moe_q4_0_q8_1_cuda(
         expert_ids,
         num_tokens_post_padded,
         exp_stride,
+        num_experts,
         ncols_x,
         nrows_x,
         ncols_y,
@@ -262,6 +277,7 @@ static void ggml_moe_q4_0_q8_1_cuda(
         expert_ids,
         num_tokens_post_padded,
         exp_stride,
+        num_experts,
         ncols_x,
         nrows_x,
         ncols_y,
@@ -294,6 +310,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q4_1, 2)
         const int* expert_ids,
         const int* num_tokens_post_padded,
         const int exp_stride,
+        const int num_experts,
         const int ncols_x,
         const int nrows_x,
         const int ncols_y,
@@ -325,6 +342,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q4_1, 2)
       expert_ids,
       num_tokens_post_padded,
       exp_stride,
+      num_experts,
       ncols_x,
       nrows_x,
       ncols_y,
@@ -342,6 +360,7 @@ static void ggml_moe_q4_1_q8_1_cuda(
     const int* expert_ids,
     const int* num_tokens_post_padded,
     const int exp_stride,
+    const int num_experts,
     const int ncols_x,
     const int nrows_x,
     const int ncols_y,
@@ -369,6 +388,7 @@ static void ggml_moe_q4_1_q8_1_cuda(
         expert_ids,
         num_tokens_post_padded,
         exp_stride,
+        num_experts,
         ncols_x,
         nrows_x,
         ncols_y,
@@ -385,6 +405,7 @@ static void ggml_moe_q4_1_q8_1_cuda(
         expert_ids,
         num_tokens_post_padded,
         exp_stride,
+        num_experts,
         ncols_x,
         nrows_x,
         ncols_y,
@@ -417,6 +438,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q5_0, 2)
         const int* expert_ids,
         const int* num_tokens_post_padded,
         const int exp_stride,
+        const int num_experts,
         const int ncols_x,
         const int nrows_x,
         const int ncols_y,
@@ -448,6 +470,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q5_0, 2)
       expert_ids,
       num_tokens_post_padded,
       exp_stride,
+      num_experts,
       ncols_x,
       nrows_x,
       ncols_y,
@@ -465,6 +488,7 @@ static void ggml_moe_q5_0_q8_1_cuda(
     const int* expert_ids,
     const int* num_tokens_post_padded,
     const int exp_stride,
+    const int num_experts,
     const int ncols_x,
     const int nrows_x,
     const int ncols_y,
@@ -492,6 +516,7 @@ static void ggml_moe_q5_0_q8_1_cuda(
         expert_ids,
         num_tokens_post_padded,
         exp_stride,
+        num_experts,
         ncols_x,
         nrows_x,
         ncols_y,
@@ -508,6 +533,7 @@ static void ggml_moe_q5_0_q8_1_cuda(
         expert_ids,
         num_tokens_post_padded,
         exp_stride,
+        num_experts,
         ncols_x,
         nrows_x,
         ncols_y,
@@ -540,6 +566,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q5_1, 2)
         const int* expert_ids,
         const int* num_tokens_post_padded,
         const int exp_stride,
+        const int num_experts,
         const int ncols_x,
         const int nrows_x,
         const int ncols_y,
@@ -571,6 +598,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q5_1, 2)
       expert_ids,
       num_tokens_post_padded,
       exp_stride,
+      num_experts,
       ncols_x,
       nrows_x,
       ncols_y,
@@ -588,6 +616,7 @@ static void ggml_moe_q5_1_q8_1_cuda(
     const int* expert_ids,
     const int* num_tokens_post_padded,
     const int exp_stride,
+    const int num_experts,
     const int ncols_x,
     const int nrows_x,
     const int ncols_y,
@@ -615,6 +644,7 @@ static void ggml_moe_q5_1_q8_1_cuda(
         expert_ids,
         num_tokens_post_padded,
         exp_stride,
+        num_experts,
         ncols_x,
         nrows_x,
         ncols_y,
@@ -631,6 +661,7 @@ static void ggml_moe_q5_1_q8_1_cuda(
         expert_ids,
         num_tokens_post_padded,
         exp_stride,
+        num_experts,
         ncols_x,
         nrows_x,
         ncols_y,
@@ -663,6 +694,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q8_0, 2)
         const int* expert_ids,
         const int* num_tokens_post_padded,
         const int exp_stride,
+        const int num_experts,
         const int ncols_x,
         const int nrows_x,
         const int ncols_y,
@@ -694,6 +726,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q8_0, 2)
       expert_ids,
       num_tokens_post_padded,
       exp_stride,
+      num_experts,
       ncols_x,
       nrows_x,
       ncols_y,
@@ -711,6 +744,7 @@ static void ggml_moe_q8_0_q8_1_cuda(
     const int* expert_ids,
     const int* num_tokens_post_padded,
     const int exp_stride,
+    const int num_experts,
     const int ncols_x,
     const int nrows_x,
     const int ncols_y,
@@ -738,6 +772,7 @@ static void ggml_moe_q8_0_q8_1_cuda(
         expert_ids,
         num_tokens_post_padded,
         exp_stride,
+        num_experts,
         ncols_x,
         nrows_x,
         ncols_y,
@@ -754,6 +789,7 @@ static void ggml_moe_q8_0_q8_1_cuda(
         expert_ids,
         num_tokens_post_padded,
         exp_stride,
+        num_experts,
         ncols_x,
         nrows_x,
         ncols_y,
@@ -786,6 +822,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q2_K, 2)
         const int* expert_ids,
         const int* num_tokens_post_padded,
         const int exp_stride,
+        const int num_experts,
         const int ncols_x,
         const int nrows_x,
         const int ncols_y,
@@ -817,6 +854,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q2_K, 2)
       expert_ids,
       num_tokens_post_padded,
       exp_stride,
+      num_experts,
       ncols_x,
       nrows_x,
       ncols_y,
@@ -834,6 +872,7 @@ static void ggml_moe_q2_K_q8_1_cuda(
     const int* expert_ids,
     const int* num_tokens_post_padded,
     const int exp_stride,
+    const int num_experts,
     const int ncols_x,
     const int nrows_x,
     const int ncols_y,
@@ -861,6 +900,7 @@ static void ggml_moe_q2_K_q8_1_cuda(
         expert_ids,
         num_tokens_post_padded,
         exp_stride,
+        num_experts,
         ncols_x,
         nrows_x,
         ncols_y,
@@ -877,6 +917,7 @@ static void ggml_moe_q2_K_q8_1_cuda(
         expert_ids,
         num_tokens_post_padded,
         exp_stride,
+        num_experts,
         ncols_x,
         nrows_x,
         ncols_y,
@@ -909,6 +950,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q3_K, 2)
         const int* expert_ids,
         const int* num_tokens_post_padded,
         const int exp_stride,
+        const int num_experts,
         const int ncols_x,
         const int nrows_x,
         const int ncols_y,
@@ -941,6 +983,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q3_K, 2)
       expert_ids,
       num_tokens_post_padded,
       exp_stride,
+      num_experts,
       ncols_x,
       nrows_x,
       ncols_y,
@@ -957,6 +1000,7 @@ static void ggml_moe_q3_K_q8_1_cuda(
     const int* expert_ids,
     const int* num_tokens_post_padded,
     const int exp_stride,
+    const int num_experts,
     const int ncols_x,
     const int nrows_x,
     const int ncols_y,
@@ -984,6 +1028,7 @@ static void ggml_moe_q3_K_q8_1_cuda(
         expert_ids,
         num_tokens_post_padded,
         exp_stride,
+        num_experts,
         ncols_x,
         nrows_x,
         ncols_y,
@@ -1000,6 +1045,7 @@ static void ggml_moe_q3_K_q8_1_cuda(
         expert_ids,
         num_tokens_post_padded,
         exp_stride,
+        num_experts,
         ncols_x,
         nrows_x,
         ncols_y,
@@ -1032,6 +1078,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q4_K, 2)
         const int* expert_ids,
         const int* num_tokens_post_padded,
         const int exp_stride,
+        const int num_experts,
         const int ncols_x,
         const int nrows_x,
         const int ncols_y,
@@ -1063,6 +1110,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q4_K, 2)
       expert_ids,
       num_tokens_post_padded,
       exp_stride,
+      num_experts,
       ncols_x,
       nrows_x,
       ncols_y,
@@ -1080,6 +1128,7 @@ static void ggml_moe_q4_K_q8_1_cuda(
     const int* expert_ids,
     const int* num_tokens_post_padded,
     const int exp_stride,
+    const int num_experts,
     const int ncols_x,
     const int nrows_x,
     const int ncols_y,
@@ -1107,6 +1156,7 @@ static void ggml_moe_q4_K_q8_1_cuda(
         expert_ids,
         num_tokens_post_padded,
         exp_stride,
+        num_experts,
         ncols_x,
         nrows_x,
         ncols_y,
@@ -1123,6 +1173,7 @@ static void ggml_moe_q4_K_q8_1_cuda(
         expert_ids,
         num_tokens_post_padded,
         exp_stride,
+        num_experts,
         ncols_x,
         nrows_x,
         ncols_y,
@@ -1155,6 +1206,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q5_K, 2)
         const int* expert_ids,
         const int* num_tokens_post_padded,
         const int exp_stride,
+        const int num_experts,
         const int ncols_x,
         const int nrows_x,
         const int ncols_y,
@@ -1186,6 +1238,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q5_K, 2)
       expert_ids,
       num_tokens_post_padded,
       exp_stride,
+      num_experts,
       ncols_x,
       nrows_x,
       ncols_y,
@@ -1203,6 +1256,7 @@ static void ggml_moe_q5_K_q8_1_cuda(
     const int* expert_ids,
     const int* num_tokens_post_padded,
     const int exp_stride,
+    const int num_experts,
     const int ncols_x,
     const int nrows_x,
     const int ncols_y,
@@ -1230,6 +1284,7 @@ static void ggml_moe_q5_K_q8_1_cuda(
         expert_ids,
         num_tokens_post_padded,
         exp_stride,
+        num_experts,
         ncols_x,
         nrows_x,
         ncols_y,
@@ -1246,6 +1301,7 @@ static void ggml_moe_q5_K_q8_1_cuda(
         expert_ids,
         num_tokens_post_padded,
         exp_stride,
+        num_experts,
         ncols_x,
         nrows_x,
         ncols_y,
@@ -1278,6 +1334,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q6_K, 2)
         const int* expert_ids,
         const int* num_tokens_post_padded,
         const int exp_stride,
+        const int num_experts,
         const int ncols_x,
         const int nrows_x,
         const int ncols_y,
@@ -1309,6 +1366,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q6_K, 2)
       expert_ids,
       num_tokens_post_padded,
       exp_stride,
+      num_experts,
       ncols_x,
       nrows_x,
       ncols_y,
@@ -1326,6 +1384,7 @@ static void ggml_moe_q6_K_q8_1_cuda(
     const int* expert_ids,
     const int* num_tokens_post_padded,
     const int exp_stride,
+    const int num_experts,
     const int ncols_x,
     const int nrows_x,
     const int ncols_y,
@@ -1353,6 +1412,7 @@ static void ggml_moe_q6_K_q8_1_cuda(
         expert_ids,
         num_tokens_post_padded,
         exp_stride,
+        num_experts,
         ncols_x,
         nrows_x,
         ncols_y,
@@ -1369,6 +1429,7 @@ static void ggml_moe_q6_K_q8_1_cuda(
         expert_ids,
         num_tokens_post_padded,
         exp_stride,
+        num_experts,
         ncols_x,
         nrows_x,
         ncols_y,

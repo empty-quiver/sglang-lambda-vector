@@ -8,6 +8,7 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
 """
 
 from dataclasses import dataclass
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -108,10 +109,37 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
         num_gpu_experts: Number of experts that should run on GPU (experts 0 to num_gpu_experts-1)
 
     Returns:
-        Modified topk_ids tensor with CPU expert IDs masked as -1
+        Cloned topk_ids tensor with CPU expert IDs masked as -1
     """
-    topk_ids[topk_ids >= num_gpu_experts] = -1
-    return topk_ids
+    return torch.where(
+        topk_ids >= num_gpu_experts,
+        torch.full_like(topk_ids, -1),
+        topk_ids,
+    )
+
+
+def mask_cpu_experts_for_cuda_graph(
+    topk_ids: torch.Tensor, topk_weights: torch.Tensor, num_gpu_experts: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cpu_or_invalid = (topk_ids < 0) | (topk_ids >= num_gpu_experts)
+    masked_topk_ids = torch.where(cpu_or_invalid, torch.zeros_like(topk_ids), topk_ids)
+    masked_topk_weights = torch.where(
+        cpu_or_invalid, torch.zeros_like(topk_weights), topk_weights
+    )
+    return masked_topk_ids, masked_topk_weights
+
+
+def current_cuda_stream_handle(device: torch.device) -> int:
+    stream = torch.cuda.current_stream(device)
+    handle = getattr(stream, "cuda_stream", None)
+    if handle is not None:
+        return handle
+    cuda_stream = getattr(stream, "__cuda_stream__", None)
+    if cuda_stream is None:
+        raise AttributeError(
+            f"Cannot extract CUDA stream handle from {type(stream).__name__}"
+        )
+    return cuda_stream()[1]
 
 
 class KTEPWrapperMethod(FusedMoEMethodBase):
@@ -158,6 +186,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # KT wrapper will be initialized in create_weights
         self.wrapper: Optional[KTMoEWrapper] = None
+        self.physical_to_logical_map_cpu: Optional[torch.Tensor] = None
+        self._physical_to_logical_map_gpu: Optional[torch.Tensor] = None
 
         # Store parameters needed for KT initialization
         self._layer_params = None
@@ -216,13 +246,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts: num_gpu_experts to num_experts-1
         if self.tp_rank == 0:
+            gpu_experts_mask = torch.zeros(num_experts, dtype=torch.bool)
+            gpu_experts_mask[: self.num_gpu_experts] = True
             self.wrapper = KTMoEWrapper(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
                 num_experts_per_tok=num_experts_per_tok,
                 hidden_size=hidden_size,
                 moe_intermediate_size=intermediate_size_full,
-                num_gpu_experts=self.num_gpu_experts,
+                gpu_experts_mask=gpu_experts_mask,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
                 weight_path=self.kt_config.weight_path,
@@ -253,9 +285,52 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             physical_to_logical_map_cpu = (
                 get_global_expert_location_metadata()
                 .physical_to_logical_map_cpu[self.kt_config.layer_idx]
+                .to(torch.int64)
                 .contiguous()
             )
+            self.physical_to_logical_map_cpu = physical_to_logical_map_cpu
+            self._physical_to_logical_map_gpu = physical_to_logical_map_cpu.to(
+                torch.device("cuda", torch.cuda.current_device()), non_blocking=True
+            )
+
+            # LLAMAFILE/GGUF loads expert tensors in logical expert order, while
+            # SGLang's expert-location dispatch routes topk ids through physical
+            # slots. Native RAWINT4/FP8/BF16 load through kt-kernel's
+            # physical-to-logical map, so those methods keep physical routing ids.
+            if (self.kt_config.method or "").upper() == "LLAMAFILE":
+                logical_gpu_mask = torch.zeros(
+                    layer.num_experts,
+                    dtype=torch.bool,
+                    device=physical_to_logical_map_cpu.device,
+                )
+                gpu_logical_ids = physical_to_logical_map_cpu[
+                    : self.num_gpu_experts
+                ].to(torch.long)
+                logical_gpu_mask[gpu_logical_ids] = True
+                self.wrapper.gpu_experts_mask.copy_(logical_gpu_mask)
+
             self.wrapper.load_weights(physical_to_logical_map_cpu)
+
+    def _cpu_topk_ids(self, topk_ids: torch.Tensor) -> torch.Tensor:
+        if (self.kt_config.method or "").upper() != "LLAMAFILE":
+            return topk_ids
+        if os.getenv("SGLANG_KT_DISABLE_CPU_TOPK_PHYSICAL_TO_LOGICAL"):
+            return topk_ids
+        if self.physical_to_logical_map_cpu is None:
+            return topk_ids
+
+        if (
+            self._physical_to_logical_map_gpu is None
+            or self._physical_to_logical_map_gpu.device != topk_ids.device
+        ):
+            self._physical_to_logical_map_gpu = self.physical_to_logical_map_cpu.to(
+                topk_ids.device, non_blocking=True
+            )
+
+        valid = topk_ids >= 0
+        safe_topk_ids = topk_ids.clamp_min(0).to(torch.long)
+        remapped = self._physical_to_logical_map_gpu[safe_topk_ids].to(topk_ids.dtype)
+        return torch.where(valid, remapped, topk_ids)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
@@ -296,10 +371,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         topk_weights, topk_ids, _ = topk_output
+        topk_ids = self._cpu_topk_ids(topk_ids)
 
         # Submit forward task to CPU (non-blocking)
         self.wrapper.submit_forward(
-            x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
+            x, topk_ids, topk_weights, current_cuda_stream_handle(x.device)
         )
 
     def sync(self, x: torch.Tensor) -> torch.Tensor:
@@ -318,9 +394,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Wait for CPU computation and retrieve results
         return self.wrapper.sync_forward(
-            x, torch.cuda.current_stream(x.device).cuda_stream
+            x, current_cuda_stream_handle(x.device)
         )
 
+    @torch.compiler.disable
     def apply(
         self,
         layer: torch.nn.Module,
@@ -344,30 +421,51 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
+        serial_cpu = bool(os.getenv("SGLANG_KT_SERIAL_CPU"))
+        skip_cpu = bool(os.getenv("SGLANG_KT_SKIP_CPU"))
 
         # Step 1: Submit CPU expert computation (non-blocking)
-        if self.tp_rank == 0:
+        if self.tp_rank == 0 and not serial_cpu and not skip_cpu:
             self.submit(layer, dispatch_output)
 
-        # Step 2: Prepare GPU computation by masking CPU expert IDs
-        # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
-        topk_ids = topk_output.topk_ids
-        masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
+        # Step 2: Execute the GPU expert slice.
+        if self.num_gpu_experts == 0:
+            output = torch.zeros_like(x)
+        else:
+            topk_ids = topk_output.topk_ids
+            topk_weights = topk_output.topk_weights
+            if torch.cuda.is_current_stream_capturing():
+                # CUDA graph capture needs fixed-shape expert routing. Represent
+                # CPU/invalid expert routes as zero-weight calls to expert 0
+                # instead of using the dynamic -1 filtering path.
+                masked_topk_ids, masked_topk_weights = mask_cpu_experts_for_cuda_graph(
+                    topk_ids, topk_weights, self.num_gpu_experts
+                )
+            else:
+                masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
+                masked_topk_weights = topk_weights
 
-        # Create modified dispatch output for GPU computation
-        masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
-        masked_dispatch_output = dispatch_output._replace(
-            topk_output=masked_topk_output
-        )
+            masked_topk_output = topk_output._replace(
+                topk_ids=masked_topk_ids, topk_weights=masked_topk_weights
+            )
+            masked_dispatch_output = dispatch_output._replace(
+                topk_output=masked_topk_output
+            )
 
-        # Step 3: Execute GPU expert computation (any quantization method)
-        # This runs in parallel with CPU computation
-        gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
+            gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
+            output = gpu_combine_input.hidden_states
 
-        # Step 4: Synchronize CPU results and merge with GPU results
-        output = gpu_combine_input.hidden_states
-        if self.tp_rank == 0:
-            cpu_output = self.sync(x)
+        # Step 3: Synchronize CPU results and merge with GPU results.
+        if self.tp_rank == 0 and not skip_cpu:
+            if serial_cpu:
+                cpu_output = self.wrapper.forward(
+                    x,
+                    self._cpu_topk_ids(topk_output.topk_ids),
+                    topk_output.topk_weights,
+                    current_cuda_stream_handle(x.device),
+                )
+            else:
+                cpu_output = self.sync(x)
             output = output + cpu_output
 
         return StandardCombineInput(hidden_states=output)

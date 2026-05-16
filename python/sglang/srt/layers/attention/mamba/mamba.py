@@ -73,6 +73,11 @@ def mamba_v2_sharded_weight_loader(
     """
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        if (
+            param.data.ndim == loaded_weight.ndim + 1
+            and param.data.size(1) == 1
+        ):
+            loaded_weight = loaded_weight.unsqueeze(1)
 
         # - track boundary of (sharded) param, and loaded_weight, respectively
         boundary, loaded_boundary = 0, 0

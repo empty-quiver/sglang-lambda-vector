@@ -60,6 +60,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
     next_power_of_2,
@@ -1294,11 +1295,66 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
                     for _ in range(self.layer_num)
                 ]
 
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.k_scale_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_scale_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_scale_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_scale_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat(
+            [
+                self.k_data_ptrs,
+                self.v_data_ptrs,
+                self.k_scale_data_ptrs,
+                self.v_scale_data_ptrs,
+            ],
+            dim=0,
+        )
+        self.data_strides = torch.tensor(
+            [
+                np.prod(x.shape[1:]) * x.dtype.itemsize
+                for x in (
+                    self.k_buffer
+                    + self.v_buffer
+                    + self.k_scale_buffer
+                    + self.v_scale_buffer
+                )
+            ],
+            device=self.device,
+        )
+
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
         del self.k_scale_buffer
         del self.v_scale_buffer
+
+    def get_kv_size_bytes(self):
+        assert hasattr(self, "k_buffer")
+        assert hasattr(self, "v_buffer")
+        k_size_bytes = 0
+        for k_cache, k_scale in zip(self.k_buffer, self.k_scale_buffer):
+            k_size_bytes += get_tensor_size_bytes(k_cache)
+            k_size_bytes += get_tensor_size_bytes(k_scale)
+        v_size_bytes = 0
+        for v_cache, v_scale in zip(self.v_buffer, self.v_scale_buffer):
+            v_size_bytes += get_tensor_size_bytes(v_cache)
+            v_size_bytes += get_tensor_size_bytes(v_scale)
+        return k_size_bytes, v_size_bytes
 
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
@@ -1422,7 +1478,11 @@ class HybridLinearKVPool(KVCache):
         self.use_mla = use_mla
         if not use_mla:
 
-            TokenToKVPoolClass = MHATokenToKVPool
+            TokenToKVPoolClass = (
+                MHATokenToKVPoolFP4
+                if is_float4_e2m1fn_x2(dtype)
+                else MHATokenToKVPool
+            )
 
             if current_platform.is_out_of_tree():
                 TokenToKVPoolClass = current_platform.get_mha_kv_pool_cls()
@@ -1445,7 +1505,11 @@ class HybridLinearKVPool(KVCache):
             )
         else:
 
-            TokenToKVPoolClass = MLATokenToKVPool
+            TokenToKVPoolClass = (
+                MLATokenToKVPoolFP4
+                if is_float4_e2m1fn_x2(dtype)
+                else MLATokenToKVPool
+            )
 
             if current_platform.is_out_of_tree():
                 TokenToKVPoolClass = current_platform.get_mla_kv_pool_cls()

@@ -78,7 +78,7 @@ class RadixLinearAttention(nn.Module):
         if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
             # Output shape from linear attention: (1, seq_len, num_v_heads, head_v_dim)
             seq_len = mixed_qkv.shape[0]
-            output = torch.empty(
+            output = torch.zeros(
                 (1, seq_len, self.num_v_heads, self.head_v_dim),
                 dtype=mixed_qkv.dtype,
                 device=mixed_qkv.device,
@@ -131,19 +131,20 @@ def unified_linear_attention_with_output(
         if hasattr(token_to_kv_pool, "set_swa_loc"):
             token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
 
-    ret = forward_batch.attn_backend.forward(
-        layer=attention_layer,
-        forward_batch=forward_batch,
-        mixed_qkv=mixed_qkv[:real_num_tokens],
-        a=a[:real_num_tokens],
-        b=b[:real_num_tokens],
-    )
-    forward_batch.out_cache_loc = original_out_cache_loc
-    forward_batch.out_cache_loc_swa = original_out_cache_loc_swa
-    if original_out_cache_loc_swa is not None and hasattr(
-        token_to_kv_pool, "set_swa_loc"
-    ):
-        token_to_kv_pool.set_swa_loc(original_swa_loc)
-
-    output[:, :real_num_tokens].copy_(ret)
+    try:
+        ret = forward_batch.attn_backend.forward(
+            layer=attention_layer,
+            forward_batch=forward_batch,
+            mixed_qkv=mixed_qkv[:real_num_tokens],
+            a=a[:real_num_tokens],
+            b=b[:real_num_tokens],
+        )
+        output[:, :real_num_tokens].copy_(ret)
+    finally:
+        forward_batch.out_cache_loc = original_out_cache_loc
+        forward_batch.out_cache_loc_swa = original_out_cache_loc_swa
+        if original_out_cache_loc_swa is not None and hasattr(
+            token_to_kv_pool, "set_swa_loc"
+        ):
+            token_to_kv_pool.set_swa_loc(original_swa_loc)
     return

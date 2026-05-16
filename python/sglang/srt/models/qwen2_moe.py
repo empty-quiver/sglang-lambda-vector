@@ -98,6 +98,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     make_layers,
+    set_weight_attrs,
     use_intel_amx_backend,
 )
 
@@ -313,6 +314,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         else:
             self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+            set_weight_attrs(
+                self.shared_expert_gate.weight,
+                {
+                    "weight_loader": self._shared_expert_gate_weight_loader,
+                },
+            )
 
         if get_moe_a2a_backend().is_deepep():
             # TODO: we will support tp < ep in the future
@@ -322,6 +329,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
             self.top_k = config.num_experts_per_tok
         self.is_nextn = is_nextn
+
+    @staticmethod
+    def _shared_expert_gate_weight_loader(param, loaded_weight):
+        if (
+            loaded_weight.ndim == 1
+            and param.ndim == 2
+            and param.size(0) == 1
+            and param.size(1) == loaded_weight.size(0)
+        ):
+            loaded_weight = loaded_weight.unsqueeze(0)
+        default_weight_loader(param, loaded_weight)
 
     def get_moe_weights(self):
         return [
@@ -436,7 +454,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     def _forward_router_experts(self, hidden_states: torch.Tensor):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        topk_output = self.topk(
+            hidden_states,
+            router_logits,
+            expert_location_dispatch_info=(
+                ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+                if not self.is_nextn
+                else None
+            ),
+        )
         if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
             topk_output
         ):

@@ -1,9 +1,19 @@
 // Adatped from
 // https://github.com/vllm-project/vllm/blob/755ed7b05be4743237d3339c4ff8c22bcaae04f4/csrc/quantization/gguf/gguf_kernel.cu
 #include <c10/cuda/CUDAGuard.h>
+#include <cstdlib>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <torch/all.h>
+
+static inline void gguf_check_cuda_launch(const char* label, cudaStream_t stream) {
+  cudaError_t err = cudaGetLastError();
+  TORCH_CHECK(err == cudaSuccess, label, " launch failed: ", cudaGetErrorString(err));
+  if (std::getenv("SGLANG_GGUF_SYNC_KERNEL") || std::getenv("SGLANG_GGUF_SYNC_MOE")) {
+    err = cudaStreamSynchronize(stream);
+    TORCH_CHECK(err == cudaSuccess, label, " failed: ", cudaGetErrorString(err));
+  }
+}
 
 // dont use clang-format here, it breaks the include order
 // clang-format off
@@ -342,6 +352,19 @@ torch::Tensor ggml_moe_a8(
     int64_t row,
     int64_t top_k,
     int64_t tokens) {
+  TORCH_CHECK(X.is_cuda() && W.is_cuda() && sorted_token_ids.is_cuda() && expert_ids.is_cuda() && num_tokens_post_padded.is_cuda(),
+              "ggml_moe_a8 expects all tensors to be CUDA tensors");
+  TORCH_CHECK(X.get_device() == W.get_device() && X.get_device() == sorted_token_ids.get_device() &&
+                  X.get_device() == expert_ids.get_device() && X.get_device() == num_tokens_post_padded.get_device(),
+              "ggml_moe_a8 expects all tensors on the same CUDA device");
+  TORCH_CHECK(X.dim() == 2, "ggml_moe_a8 expects X to be rank 2");
+  TORCH_CHECK(W.dim() >= 2, "ggml_moe_a8 expects W to include an expert dimension");
+  TORCH_CHECK(X.is_contiguous() && W.is_contiguous(), "ggml_moe_a8 expects contiguous X and W");
+  TORCH_CHECK(sorted_token_ids.scalar_type() == torch::kInt32 && expert_ids.scalar_type() == torch::kInt32 &&
+                  num_tokens_post_padded.scalar_type() == torch::kInt32,
+              "ggml_moe_a8 expects int32 sorted_token_ids, expert_ids, and num_tokens_post_padded");
+  TORCH_CHECK(top_k > 0 && tokens == X.sizes()[0], "ggml_moe_a8 received inconsistent top_k/tokens");
+  TORCH_CHECK(W.sizes()[0] > 0 && W.sizes()[0] <= 2147483647, "ggml_moe_a8 received an invalid expert count");
   int col = X.sizes()[1];
   int padded = (col + 512 - 1) / 512 * 512;
   const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
@@ -352,6 +375,7 @@ torch::Tensor ggml_moe_a8(
   at::Tensor quant_X = torch::empty({tokens, padded / 32 * 9}, options);
   DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_moe_a8", [&] {
     quantize_row_q8_1_cuda((scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, tokens, stream);
+    gguf_check_cuda_launch("ggml_moe_a8 quantize_row_q8_1_cuda", stream);
     switch (type) {
       case 2:
         ggml_moe_q4_0_q8_1_cuda(
@@ -362,6 +386,7 @@ torch::Tensor ggml_moe_a8(
             (int*)expert_ids.data_ptr(),
             (int*)num_tokens_post_padded.data_ptr(),
             W.stride(0),
+            static_cast<int>(W.sizes()[0]),
             col,
             row,
             tokens,
@@ -380,6 +405,7 @@ torch::Tensor ggml_moe_a8(
             (int*)expert_ids.data_ptr(),
             (int*)num_tokens_post_padded.data_ptr(),
             W.stride(0),
+            static_cast<int>(W.sizes()[0]),
             col,
             row,
             tokens,
@@ -398,6 +424,7 @@ torch::Tensor ggml_moe_a8(
             (int*)expert_ids.data_ptr(),
             (int*)num_tokens_post_padded.data_ptr(),
             W.stride(0),
+            static_cast<int>(W.sizes()[0]),
             col,
             row,
             tokens,
@@ -416,6 +443,7 @@ torch::Tensor ggml_moe_a8(
             (int*)expert_ids.data_ptr(),
             (int*)num_tokens_post_padded.data_ptr(),
             W.stride(0),
+            static_cast<int>(W.sizes()[0]),
             col,
             row,
             tokens,
@@ -434,6 +462,7 @@ torch::Tensor ggml_moe_a8(
             (int*)expert_ids.data_ptr(),
             (int*)num_tokens_post_padded.data_ptr(),
             W.stride(0),
+            static_cast<int>(W.sizes()[0]),
             col,
             row,
             tokens,
@@ -452,6 +481,7 @@ torch::Tensor ggml_moe_a8(
             (int*)expert_ids.data_ptr(),
             (int*)num_tokens_post_padded.data_ptr(),
             W.stride(0),
+            static_cast<int>(W.sizes()[0]),
             col,
             row,
             tokens,
@@ -470,6 +500,7 @@ torch::Tensor ggml_moe_a8(
             (int*)expert_ids.data_ptr(),
             (int*)num_tokens_post_padded.data_ptr(),
             W.stride(0),
+            static_cast<int>(W.sizes()[0]),
             col,
             row,
             tokens,
@@ -488,6 +519,7 @@ torch::Tensor ggml_moe_a8(
             (int*)expert_ids.data_ptr(),
             (int*)num_tokens_post_padded.data_ptr(),
             W.stride(0),
+            static_cast<int>(W.sizes()[0]),
             col,
             row,
             tokens,
@@ -506,6 +538,7 @@ torch::Tensor ggml_moe_a8(
             (int*)expert_ids.data_ptr(),
             (int*)num_tokens_post_padded.data_ptr(),
             W.stride(0),
+            static_cast<int>(W.sizes()[0]),
             col,
             row,
             tokens,
@@ -524,6 +557,7 @@ torch::Tensor ggml_moe_a8(
             (int*)expert_ids.data_ptr(),
             (int*)num_tokens_post_padded.data_ptr(),
             W.stride(0),
+            static_cast<int>(W.sizes()[0]),
             col,
             row,
             tokens,
@@ -533,7 +567,10 @@ torch::Tensor ggml_moe_a8(
             sorted_token_ids.sizes()[0],
             stream);
         break;
+      default:
+        TORCH_CHECK(false, "unsupported GGUF MoE quant type: ", type);
     }
+    gguf_check_cuda_launch("ggml_moe_a8 qtype kernel", stream);
   });
   return Y;
 }

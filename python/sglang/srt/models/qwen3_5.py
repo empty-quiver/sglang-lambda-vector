@@ -50,6 +50,7 @@ from sglang.srt.layers.dp_attention import (
 
 # Layers - Others
 from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.logits_processor import LogitsProcessor
 
 # Layers - Linear
 from sglang.srt.layers.linear import (
@@ -68,7 +69,10 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
@@ -1013,7 +1017,11 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
 
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = (
+            torch.cuda.Stream()
+            if _is_cuda and not get_global_server_args().enable_torch_compile
+            else None
+        )
 
         # Embedding layer
         if self.pp_group.is_first_rank:
@@ -1021,6 +1029,8 @@ class Qwen3_5ForCausalLM(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 org_num_embeddings=config.vocab_size,
+                quant_config=quant_config,
+                prefix=add_prefix("embed_tokens", prefix),
                 enable_tp=not is_dp_attention_enabled(),
             )
         else:
@@ -1058,6 +1068,22 @@ class Qwen3_5ForCausalLM(nn.Module):
             self.norm = PPMissingLayer()
 
         self.layers_to_capture = []
+        self.standalone_causal_lm = prefix == "" and not is_nextn
+        if self.standalone_causal_lm:
+            if self.pp_group.is_last_rank:
+                if self.pp_group.world_size == 1 and config.tie_word_embeddings:
+                    self.lm_head = self.embed_tokens
+                else:
+                    self.lm_head = ParallelLMHead(
+                        config.vocab_size,
+                        config.hidden_size,
+                        quant_config=quant_config,
+                        use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                        prefix=add_prefix("lm_head", prefix),
+                    )
+            else:
+                self.lm_head = PPMissingLayer()
+            self.logits_processor = LogitsProcessor(config)
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -1142,6 +1168,15 @@ class Qwen3_5ForCausalLM(nn.Module):
                 hidden_states = self.norm(hidden_states)
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
+
+        if self.standalone_causal_lm:
+            return self.logits_processor(
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                forward_batch,
+                aux_hidden_states if len(aux_hidden_states) != 0 else None,
+            )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -1396,10 +1431,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                             )
                     else:
                         # Skip loading extra parameters for GPTQ/modelopt models.
-                        if (
-                            name_mapped.endswith(ignore_suffixes)
-                            and name_mapped not in params_dict
-                        ):
+                        if name_mapped not in params_dict:
                             continue
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or
@@ -1909,10 +1941,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                 )
                     else:
                         # Skip loading extra parameters for GPTQ models.
-                        if (
-                            name_mapped.endswith(ignore_suffixes)
-                            and name_mapped not in params_dict
-                        ):
+                        if name_mapped not in params_dict:
                             continue
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or
@@ -1976,4 +2005,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
 
 
-EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
+EntryClass = [
+    Qwen3_5MoeForConditionalGeneration,
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5MoeForCausalLM,
+    Qwen3_5ForCausalLM,
+]

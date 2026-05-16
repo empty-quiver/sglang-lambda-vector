@@ -214,16 +214,42 @@ def get_config(
         model_config_parser = "mistral" if is_mistral_model(model) else "hf"
 
     parser = get_model_config_parser(model_config_parser)
-    config = parser.parse(
-        model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-    )
+    try:
+        config = parser.parse(
+            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        )
+    except ValueError as exc:
+        if (
+            is_gguf
+            and "GGUF model with architecture" in str(exc)
+            and (Path(model) / "config.json").exists()
+        ):
+            fallback_kwargs = dict(kwargs)
+            fallback_kwargs.pop("gguf_file", None)
+            config = parser.parse(
+                model,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **fallback_kwargs,
+            )
+            if getattr(config, "model_type", None) in ("qwen3_5", "qwen3_5_moe"):
+                config = config.text_config
+        else:
+            raise
 
     if model_override_args:
         config.update(model_override_args)
 
     if is_gguf:
-        if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
+        if config.model_type == "qwen3_5_moe_text":
+            _set_architectures(config, "Qwen3_5MoeForCausalLM")
+        elif config.model_type == "qwen3_5_text":
+            _set_architectures(config, "Qwen3_5ForCausalLM")
+        elif config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
             raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
-        _set_architectures(config, MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type])
+        else:
+            _set_architectures(
+                config, MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
+            )
 
     return config

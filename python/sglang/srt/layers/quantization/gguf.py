@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import warnings
 from typing import TYPE_CHECKING, Any, List, Optional
 
@@ -36,7 +37,10 @@ _is_musa = is_musa()
 _is_npu = is_npu()
 
 if _is_cuda:
-    from sgl_kernel import moe_align_block_size, moe_sum
+    from sgl_kernel import moe_sum
+    from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+        moe_align_block_size,
+    )
     from sgl_kernel.quantization import (
         ggml_dequantize,
         ggml_moe_a8,
@@ -48,7 +52,10 @@ if _is_cuda:
 
     from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
 elif _is_musa:
-    from sgl_kernel import gelu_and_mul, moe_align_block_size, moe_sum, silu_and_mul
+    from sgl_kernel import gelu_and_mul, moe_sum, silu_and_mul
+    from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+        moe_align_block_size,
+    )
     from sgl_kernel.quantization import (
         ggml_dequantize,
         ggml_moe_a8,
@@ -199,6 +206,18 @@ def fused_mul_mat_gguf(
     return y
 
 
+def _gguf_quant_type_to_int(qweight_type: int) -> int:
+    if isinstance(qweight_type, torch.Tensor):
+        return int(qweight_type.item())
+    return int(qweight_type)
+
+
+def _gguf_moe_block_size(qweight_type: int) -> int:
+    # Matches sgl-kernel's MOE_X_* constants. This is the token tile used by
+    # ggml_moe_a8, not the GGUF quantization block size.
+    return 8 if _is_hip else 4
+
+
 def fused_moe_gguf(
     x: torch.Tensor,
     w1: torch.Tensor,
@@ -208,6 +227,7 @@ def fused_moe_gguf(
     qweight_type: int,
     qweight_type2: int,
     activation: str,
+    debug_layer: Optional[int] = None,
 ) -> torch.Tensor:
     def act(x: torch.Tensor):
         if activation == "silu":
@@ -217,20 +237,117 @@ def fused_moe_gguf(
         raise ValueError(f"Unsupported activation: {activation}")
 
     out_hidden_states = torch.empty_like(x)
+    if not (_is_cuda and torch.cuda.is_current_stream_capturing()) and torch.any(
+        topk_ids < 0
+    ):
+        out_hidden_states = torch.zeros_like(x)
+        active_mask = topk_ids >= 0
+        active_topk_ids = topk_ids[active_mask].view(-1, 1).contiguous()
+        active_tokens = active_topk_ids.shape[0]
+        if active_tokens == 0:
+            return out_hidden_states
+
+        num_tokens = x.shape[0]
+        token_ids = (
+            torch.arange(num_tokens, device=x.device, dtype=torch.long)
+            .view(-1, 1)
+            .expand_as(topk_ids)
+        )
+        active_token_ids = token_ids[active_mask].contiguous()
+        active_weights = topk_weights[active_mask].view(active_tokens, 1)
+        active_x = x.index_select(0, active_token_ids)
+
+        active_out = fused_moe_gguf(
+            x=active_x,
+            w1=w1,
+            w2=w2,
+            topk_weights=active_weights,
+            topk_ids=active_topk_ids,
+            qweight_type=qweight_type,
+            qweight_type2=qweight_type2,
+            activation=activation,
+            debug_layer=debug_layer,
+        )
+        out_hidden_states.index_add_(0, active_token_ids, active_out)
+        return out_hidden_states
+
     # unless we decent expert reuse we are better off running moe_vec kernel
     if (
-        qweight_type2 in MMQ_QUANT_TYPES
+        not os.getenv("SGLANG_GGUF_FORCE_VEC")
+        and qweight_type2 in MMQ_QUANT_TYPES
         and qweight_type in MMQ_QUANT_TYPES
         and x.shape[0] > 64
     ):
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
         top_k = topk_ids.shape[1]
-        BLOCK_SIZE = ggml_moe_get_block_size(qweight_type)
+        BLOCK_SIZE = _gguf_moe_block_size(qweight_type)
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids, BLOCK_SIZE, E
         )
+        if os.getenv("SGLANG_GGUF_SYNC_MOE"):
+            print(
+                "[GGUF_MOE_SYNC post_align] "
+                f"layer={debug_layer} sorted={tuple(sorted_token_ids.shape)} "
+                f"experts={tuple(expert_ids.shape)} block={BLOCK_SIZE}",
+                flush=True,
+            )
+            torch.cuda.synchronize()
+            print(f"[GGUF_MOE_SYNC post_align_sync_ok] layer={debug_layer}", flush=True)
+        debug_target = os.getenv("SGLANG_GGUF_DEBUG_LAYER")
+        debug_enabled = os.getenv("SGLANG_GGUF_DEBUG_MOE") and (
+            debug_target is None
+            or debug_layer is None
+            or str(debug_layer) == debug_target
+        )
+        if debug_enabled:
+            torch.cuda.synchronize()
+            post_padded = int(num_tokens_post_padded.item())
+            num_blocks = (post_padded + BLOCK_SIZE - 1) // BLOCK_SIZE
+            expert_slice = expert_ids[:num_blocks]
+            sorted_slice = sorted_token_ids[:post_padded]
+            save_dir = os.getenv("SGLANG_GGUF_DEBUG_SAVE")
+            if save_dir and topk_ids.shape[1] == 1:
+                os.makedirs(save_dir, exist_ok=True)
+                save_path = os.path.join(
+                    save_dir,
+                    f"gguf_moe_layer{debug_layer}_active_{x.shape[0]}.pt",
+                )
+                if not os.path.exists(save_path):
+                    torch.save(
+                        {
+                            "x": x.detach().cpu(),
+                            "w1": w1.detach().cpu(),
+                            "sorted_token_ids": sorted_token_ids.detach().cpu(),
+                            "expert_ids": expert_ids.detach().cpu(),
+                            "num_tokens_post_padded": num_tokens_post_padded.detach().cpu(),
+                            "topk_ids": topk_ids.detach().cpu(),
+                            "topk_weights": topk_weights.detach().cpu(),
+                            "qweight_type": qweight_type,
+                            "qweight_type2": qweight_type2,
+                            "w1_shape": tuple(w1.shape),
+                            "w1_stride": tuple(w1.stride()),
+                            "w1_dtype": str(w1.dtype),
+                            "w2_shape": tuple(w2.shape),
+                            "w2_stride": tuple(w2.stride()),
+                            "w2_dtype": str(w2.dtype),
+                            "debug_layer": debug_layer,
+                        },
+                        save_path,
+                    )
+                    print(f"[GGUF_MOE_DEBUG saved] {save_path}", flush=True)
+            print(
+                "[GGUF_MOE_DEBUG pre_moe1] "
+                f"layer={debug_layer} x={tuple(x.shape)} "
+                f"w1={tuple(w1.shape)} w2={tuple(w2.shape)} "
+                f"topk={tuple(topk_ids.shape)} qtypes=({qweight_type},{qweight_type2}) "
+                f"block={BLOCK_SIZE} post={post_padded} "
+                f"topk_minmax=({int(topk_ids.min().item())},{int(topk_ids.max().item())}) "
+                f"expert_minmax=({int(expert_slice.min().item())},{int(expert_slice.max().item())}) "
+                f"sorted_minmax=({int(sorted_slice.min().item())},{int(sorted_slice.max().item())})",
+                flush=True,
+            )
         out = ggml_moe_a8(
             x,
             w1,
@@ -242,23 +359,101 @@ def fused_moe_gguf(
             top_k,
             num_tokens,
         )
+        if os.getenv("SGLANG_GGUF_SYNC_MOE"):
+            print(
+                "[GGUF_MOE_SYNC post_moe1] "
+                f"layer={debug_layer} out={tuple(out.shape)} out_stride={out.stride()} "
+                f"num_tokens={num_tokens} top_k={top_k} hidden={N}",
+                flush=True,
+            )
+            torch.cuda.synchronize()
+            print(f"[GGUF_MOE_SYNC post_moe1_sync_ok] layer={debug_layer}", flush=True)
+        if debug_enabled:
+            print(
+                "[GGUF_MOE_DEBUG post_moe1] "
+                f"layer={debug_layer} out={tuple(out.shape)} "
+                f"contiguous={out.is_contiguous()} stride={out.stride()}",
+                flush=True,
+            )
+            torch.cuda.synchronize()
+            print(f"[GGUF_MOE_DEBUG post_moe1_sync_ok] layer={debug_layer}", flush=True)
         out = act(out)
-        out = ggml_moe_a8(
-            out,
-            w2,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            qweight_type2,
-            w2.shape[1],
-            1,
-            num_tokens * top_k,
-        )
+        if os.getenv("SGLANG_GGUF_SYNC_MOE"):
+            print(
+                "[GGUF_MOE_SYNC post_act] "
+                f"layer={debug_layer} out={tuple(out.shape)} out_stride={out.stride()}",
+                flush=True,
+            )
+            torch.cuda.synchronize()
+            print(f"[GGUF_MOE_SYNC post_act_sync_ok] layer={debug_layer}", flush=True)
+        second_save_dir = os.getenv("SGLANG_GGUF_DEBUG_SECOND_SAVE")
+        if second_save_dir and (
+            debug_target is None
+            or debug_layer is None
+            or str(debug_layer) == debug_target
+        ):
+            os.makedirs(second_save_dir, exist_ok=True)
+            second_save_path = os.path.join(
+                second_save_dir,
+                f"gguf_moe_layer{debug_layer}_second_{out.shape[0]}.pt",
+            )
+            if not os.path.exists(second_save_path):
+                torch.save(
+                    {
+                        "x": out.detach().cpu(),
+                        "w2": w2.detach().cpu(),
+                        "sorted_token_ids": sorted_token_ids.detach().cpu(),
+                        "expert_ids": expert_ids.detach().cpu(),
+                        "num_tokens_post_padded": num_tokens_post_padded.detach().cpu(),
+                        "topk_weights": topk_weights.detach().cpu(),
+                        "qweight_type2": qweight_type2,
+                        "row": w2.shape[1],
+                        "top_k": 1,
+                        "tokens": num_tokens * top_k,
+                        "debug_layer": debug_layer,
+                    },
+                    second_save_path,
+                )
+                print(f"[GGUF_MOE_DEBUG second_saved] {second_save_path}", flush=True)
+        if os.getenv("SGLANG_GGUF_FORCE_VEC_W2"):
+            out = ggml_moe_a8_vec(
+                out, w2, topk_ids, 1, qweight_type2, w2.shape[1], num_tokens * top_k
+            )
+        else:
+            out = ggml_moe_a8(
+                out,
+                w2,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                qweight_type2,
+                w2.shape[1],
+                1,
+                num_tokens * top_k,
+            )
+        if os.getenv("SGLANG_GGUF_SYNC_MOE"):
+            print(
+                "[GGUF_MOE_SYNC pre_mul] "
+                f"layer={debug_layer} out={tuple(out.shape)} out_stride={out.stride()} "
+                f"weights={tuple(topk_weights.shape)} weights_stride={topk_weights.stride()} "
+                f"num_tokens={num_tokens} top_k={top_k} hidden={w2.shape[1]}",
+                flush=True,
+            )
+            torch.cuda.synchronize()
+            print(f"[GGUF_MOE_SYNC pre_mul_sync_ok] layer={debug_layer}", flush=True)
         out = out.reshape(num_tokens, top_k, w2.shape[1]).mul_(
             topk_weights.view(num_tokens, top_k, 1)
         )
+        if os.getenv("SGLANG_GGUF_SYNC_MOE"):
+            print(f"[GGUF_MOE_SYNC post_mul] layer={debug_layer}", flush=True)
+            torch.cuda.synchronize()
+            print(f"[GGUF_MOE_SYNC post_mul_sync_ok] layer={debug_layer}", flush=True)
         # TODO(FlamingoPg): maybe we can use moe_sum_reduce here?
         moe_sum(out, out_hidden_states)
+        if os.getenv("SGLANG_GGUF_SYNC_MOE"):
+            print(f"[GGUF_MOE_SYNC post_moe_sum] layer={debug_layer}", flush=True)
+            torch.cuda.synchronize()
+            print(f"[GGUF_MOE_SYNC post_moe_sum_sync_ok] layer={debug_layer}", flush=True)
     elif qweight_type2 in MMVQ_QUANT_TYPES and qweight_type in MMVQ_QUANT_TYPES:
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
@@ -425,6 +620,14 @@ class GGUFLinearMethod(LinearMethodBase):
             set_weight_attrs(padded_param, {"shard_offset_map": shard_offset_map})
             layer.register_parameter("qweight", padded_param)
 
+    @staticmethod
+    def _logical_shard_sort_key(shard_id):
+        if isinstance(shard_id, tuple):
+            return (0, min(shard_id))
+        if isinstance(shard_id, str):
+            return (0, {"q": 0, "k": 1, "v": 2}.get(shard_id, 1000))
+        return (0, int(shard_id))
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -435,7 +638,7 @@ class GGUFLinearMethod(LinearMethodBase):
 
         if shard_id:
             # dequantize shard weights respectively
-            shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id
+            shard_id = sorted(shard_id, key=self._logical_shard_sort_key)
             qweight = layer.qweight
             result = []
             for idx in shard_id:
@@ -465,6 +668,8 @@ class GGUFMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: GGUFConfig):
         self.quant_config = quant_config
+        self.fused_experts = None
+        self.num_gpu_experts = -1
 
     def create_weights(
         self,
@@ -533,6 +738,10 @@ class GGUFMoEMethod(FusedMoEMethodBase):
     ):
         self.moe_runner_config = moe_runner_config
 
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        if hasattr(layer, "materialize_gguf_weights"):
+            layer.materialize_gguf_weights()
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -552,6 +761,15 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         moe_runner_config = self.moe_runner_config
 
         topk_weights, topk_ids, _ = topk_output
+        debug_layer = getattr(layer, "layer_id", None)
+        if os.getenv("SGLANG_GGUF_TRACE_LAYER_IDS"):
+            print(
+                "[GGUF_MOE_TRACE apply] "
+                f"layer={debug_layer} x={tuple(x.shape)} topk={tuple(topk_ids.shape)} "
+                f"topk_minmax=({int(topk_ids.min().item())},{int(topk_ids.max().item())})",
+                flush=True,
+            )
+
         output = fused_moe_gguf(
             x=x,
             w1=layer.w13_qweight,
@@ -561,6 +779,7 @@ class GGUFMoEMethod(FusedMoEMethodBase):
             qweight_type=layer.w13_qweight_type.weight_type,
             qweight_type2=layer.w2_qweight_type.weight_type,
             activation=moe_runner_config.activation,
+            debug_layer=debug_layer,
         )
         return StandardCombineInput(hidden_states=output)
 

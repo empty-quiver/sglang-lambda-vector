@@ -2047,13 +2047,18 @@ class GGUFModelLoader(BaseModelLoader):
                 "Please install gguf via `pip install gguf` to use gguf quantizer."
             ) from err
 
-        config = model_config.hf_config
+        config = getattr(model_config.hf_config, "text_config", model_config.hf_config)
         model_type = config.model_type
         # hack: ggufs have a different name than transformers
         if model_type == "cohere":
             model_type = "command-r"
         elif model_type == "qwen3_moe":
             model_type = "qwen3moe"
+        elif model_type in ("qwen3_5_moe", "qwen3_5_moe_text"):
+            model_type = "qwen35moe"
+        elif model_type in ("qwen3_5", "qwen3_5_text"):
+            model_type = "qwen35"
+        strip_qwen35_model_prefix = model_type in ("qwen35moe", "qwen35")
         arch = None
         for key, value in gguf.MODEL_ARCH_NAMES.items():
             if value == model_type:
@@ -2061,17 +2066,44 @@ class GGUFModelLoader(BaseModelLoader):
                 break
         if arch is None:
             raise RuntimeError(f"Unknown gguf model_type: {model_type}")
+        if not hasattr(config, "layer_types") and hasattr(config, "layers_block_type"):
+            config.layer_types = [
+                "full_attention" if layer_type == "attention" else layer_type
+                for layer_type in config.layers_block_type
+            ]
         num_layers = config.num_hidden_layers
         name_map = gguf.get_tensor_name_map(arch, num_layers)
         with torch.device("meta"):
             dummy_model = AutoModelForCausalLM.from_config(config)
         state_dict = dummy_model.state_dict()
 
+        def normalize_hf_name(hf_name: str) -> str:
+            if strip_qwen35_model_prefix and hf_name.startswith("model."):
+                return hf_name.removeprefix("model.")
+            return hf_name
+
         gguf_to_hf_name_map = {}
         for hf_name in state_dict:
+            if ".mlp.experts.gate_up_proj" in hf_name or ".mlp.experts.down_proj" in hf_name:
+                continue
+
+            gguf_name = name_map.get_name(hf_name)
+            if gguf_name is not None:
+                gguf_to_hf_name_map[gguf_name] = normalize_hf_name(hf_name)
+                continue
+
+            match = re.match(r"model\.layers\.(\d+)\.linear_attn\.dt_bias$", hf_name)
+            if match:
+                gguf_to_hf_name_map[f"blk.{match.group(1)}.ssm_dt.bias"] = (
+                    normalize_hf_name(hf_name)
+                )
+                continue
+
             name, suffix = hf_name.rsplit(".", 1)
             gguf_name = name_map.get_name(name)
-            gguf_to_hf_name_map[f"{gguf_name}.{suffix}"] = hf_name
+            if gguf_name is None:
+                continue
+            gguf_to_hf_name_map[f"{gguf_name}.{suffix}"] = normalize_hf_name(hf_name)
         return gguf_to_hf_name_map
 
     def _get_weights_iterator(
