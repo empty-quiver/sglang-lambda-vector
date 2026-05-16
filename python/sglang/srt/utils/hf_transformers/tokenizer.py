@@ -134,6 +134,205 @@ class TokenizerWarningsFilter(logging.Filter):
 # ---------------------------------------------------------------------------
 
 
+def _gguf_part_to_bytes(part) -> bytes:
+    if hasattr(part, "tobytes"):
+        return part.tobytes()
+    if isinstance(part, bytes):
+        return part
+    return bytes(part)
+
+
+def _gguf_get_string(reader, key: str, default=None):
+    field = reader.fields.get(key)
+    if field is None or not field.data:
+        return default
+    raw = _gguf_part_to_bytes(field.parts[field.data[0]])
+    return raw.decode("utf-8", errors="replace")
+
+
+def _gguf_get_int(reader, key: str, default=None):
+    field = reader.fields.get(key)
+    if field is None or not field.data:
+        return default
+
+    part = field.parts[field.data[0]]
+    if hasattr(part, "item"):
+        try:
+            return int(part.item())
+        except (TypeError, ValueError):
+            pass
+
+    raw = _gguf_part_to_bytes(part)
+    if not raw:
+        return default
+    return int.from_bytes(raw, byteorder="little", signed=False)
+
+
+def _gguf_get_string_array(reader, key: str):
+    field = reader.fields[key]
+    values = []
+    for idx in field.data:
+        raw = _gguf_part_to_bytes(field.parts[idx])
+        values.append(raw.decode("utf-8", errors="replace"))
+    return values
+
+
+def _gguf_get_int_array(reader, key: str):
+    field = reader.fields.get(key)
+    if field is None:
+        return None
+
+    values = []
+    for idx in field.data:
+        part = field.parts[idx]
+        if hasattr(part, "item"):
+            try:
+                values.append(int(part.item()))
+                continue
+            except (TypeError, ValueError):
+                pass
+        raw = _gguf_part_to_bytes(part)
+        values.append(int.from_bytes(raw, byteorder="little", signed=False))
+    return values
+
+
+def _valid_token_id(token_id, tokens) -> bool:
+    return token_id is not None and 0 <= token_id < len(tokens)
+
+
+def _try_load_deepseek_v4_gguf_tokenizer(tokenizer_name: str):
+    """Load the DeepSeek V4 GGUF tokenizer directly from metadata.
+
+    Transformers' GGUF path currently checks model architecture by walking into
+    the full checkpoint-conversion loader. For large DS4 GGUFs, that is both
+    unsupported and far too heavy for tokenizer initialization. DS4 stores a
+    standard GPT-2/ByteLevel BPE tokenizer in GGUF metadata, so we can construct
+    the fast tokenizer directly without touching tensor data.
+    """
+    if not check_gguf_file(tokenizer_name):
+        return None
+
+    _ensure_gguf_version()
+
+    try:
+        from gguf import GGUFReader
+        from tokenizers import AddedToken, Tokenizer
+        from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+        from tokenizers.models import BPE
+        from tokenizers.pre_tokenizers import ByteLevel
+    except ImportError as e:
+        logger.debug("DeepSeek V4 GGUF tokenizer dependencies unavailable: %s", e)
+        return None
+
+    try:
+        reader = GGUFReader(tokenizer_name)
+        architecture = _gguf_get_string(reader, "general.architecture")
+    except (OSError, KeyError, RuntimeError, ValueError) as e:
+        logger.debug(
+            "Failed to inspect GGUF tokenizer metadata for %s: %s",
+            tokenizer_name,
+            e,
+        )
+        return None
+
+    if architecture != "deepseek4":
+        return None
+
+    try:
+        tokenizer_model = _gguf_get_string(reader, "tokenizer.ggml.model")
+        if tokenizer_model != "gpt2":
+            raise ValueError(
+                f"unsupported tokenizer.ggml.model={tokenizer_model!r}; expected 'gpt2'"
+            )
+
+        tokens = _gguf_get_string_array(reader, "tokenizer.ggml.tokens")
+        merges = [
+            tuple(merge.split(" ", 1))
+            for merge in _gguf_get_string_array(reader, "tokenizer.ggml.merges")
+        ]
+        if any(len(merge) != 2 for merge in merges):
+            raise ValueError("GGUF BPE merges must split into token pairs")
+
+        token_types = _gguf_get_int_array(reader, "tokenizer.ggml.token_type")
+        if token_types is None:
+            token_types = [1] * len(tokens)
+        elif len(token_types) != len(tokens):
+            raise ValueError(
+                f"token type count {len(token_types)} does not match token count "
+                f"{len(tokens)}"
+            )
+
+        raw_tokenizer = Tokenizer(
+            BPE(
+                vocab={token: token_id for token_id, token in enumerate(tokens)},
+                merges=merges,
+                unk_token=None,
+                fuse_unk=False,
+            )
+        )
+        raw_tokenizer.pre_tokenizer = ByteLevel(
+            add_prefix_space=False, use_regex=True
+        )
+        raw_tokenizer.decoder = ByteLevelDecoder()
+
+        control_tokens = [
+            AddedToken(
+                token,
+                single_word=False,
+                lstrip=False,
+                rstrip=False,
+                normalized=False,
+                special=True,
+            )
+            for token, token_type in zip(tokens, token_types)
+            if token_type != 1
+        ]
+        raw_tokenizer.add_special_tokens(control_tokens)
+
+        bos_id = _gguf_get_int(reader, "tokenizer.ggml.bos_token_id")
+        eos_id = _gguf_get_int(reader, "tokenizer.ggml.eos_token_id")
+        pad_id = _gguf_get_int(reader, "tokenizer.ggml.padding_token_id", eos_id)
+
+        fast_kwargs = dict(
+            tokenizer_object=raw_tokenizer,
+            clean_up_tokenization_spaces=False,
+        )
+        if _valid_token_id(bos_id, tokens):
+            fast_kwargs["bos_token"] = tokens[bos_id]
+        if _valid_token_id(eos_id, tokens):
+            fast_kwargs["eos_token"] = tokens[eos_id]
+        if _valid_token_id(pad_id, tokens):
+            fast_kwargs["pad_token"] = tokens[pad_id]
+
+        context_length = _gguf_get_int(reader, f"{architecture}.context_length")
+        if context_length is not None:
+            fast_kwargs["model_max_length"] = context_length
+
+        tokenizer = PreTrainedTokenizerFast(**fast_kwargs)
+        tokenizer.chat_template = _gguf_get_string(reader, "tokenizer.chat_template")
+        tokenizer.add_bos_token = bool(
+            _gguf_get_int(reader, "tokenizer.ggml.add_bos_token", False)
+        )
+        tokenizer.add_eos_token = bool(
+            _gguf_get_int(reader, "tokenizer.ggml.add_eos_token", False)
+        )
+
+        logger.info(
+            "Loaded DeepSeek V4 GGUF tokenizer metadata from %s: "
+            "vocab=%d merges=%d control_tokens=%d",
+            tokenizer_name,
+            len(tokens),
+            len(merges),
+            len(control_tokens),
+        )
+        return tokenizer
+    except (KeyError, RuntimeError, TypeError, ValueError) as e:
+        raise RuntimeError(
+            f"Failed to load DeepSeek V4 GGUF tokenizer metadata from "
+            f"{tokenizer_name}: {e}"
+        ) from e
+
+
 def _resolve_tokenizer_name(tokenizer_name, kwargs):
     """Resolve special name formats (GGUF, remote URLs, etc.) to a local path.
 
@@ -269,6 +468,10 @@ def _fix_v5_tokenizer_components(tokenizer, model_name_or_path, revision=None):
     if backend is None:
         return
 
+    local_path = Path(model_name_or_path)
+    if local_path.exists() and not (local_path / "tokenizer.json").exists():
+        return
+
     try:
         from tokenizers import Tokenizer as RawTokenizer
 
@@ -334,6 +537,10 @@ def _fix_v5_add_bos_eos_token(tokenizer, model_name_or_path, revision=None):
             "CohereTokenizerFast",
         }
     )
+
+    local_path = Path(model_name_or_path)
+    if local_path.exists() and not (local_path / "tokenizer_config.json").exists():
+        return
 
     try:
         config_file = _resolve_local_or_cached_file(
@@ -485,6 +692,15 @@ def get_tokenizer(
         # use_fast still matters. Set explicitly for those fallback paths.
         if "use_fast" not in kwargs:
             kwargs["use_fast"] = True
+
+    if tokenizer_mode != "slow":
+        gguf_tokenizer = _try_load_deepseek_v4_gguf_tokenizer(tokenizer_name)
+        if gguf_tokenizer is not None:
+            return _apply_post_load_fixes(
+                gguf_tokenizer,
+                str(Path(tokenizer_name).parent),
+                tokenizer_revision,
+            )
 
     tokenizer_name = _resolve_tokenizer_name(tokenizer_name, kwargs)
 
