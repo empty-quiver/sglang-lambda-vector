@@ -18,6 +18,10 @@ import torch
 
 try:
     from .ds4_cuda_reference_attention import ds4_cuda_sparse_attention_from_fixture
+    from .ds4_synthetic_attention_fixtures import DEFAULT_LONG_SPECS
+    from .ds4_synthetic_attention_fixtures import (
+        make_synthetic_dsv4_attention_fixture,
+    )
     from .ds4_torch_reference_attention import (
         _collect_fixture_paths,
         compare_tensors,
@@ -25,6 +29,10 @@ try:
     )
 except ImportError:
     from ds4_cuda_reference_attention import ds4_cuda_sparse_attention_from_fixture  # type: ignore
+    from ds4_synthetic_attention_fixtures import DEFAULT_LONG_SPECS  # type: ignore
+    from ds4_synthetic_attention_fixtures import (  # type: ignore
+        make_synthetic_dsv4_attention_fixture,
+    )
     from ds4_torch_reference_attention import (  # type: ignore
         _collect_fixture_paths,
         compare_tensors,
@@ -41,6 +49,37 @@ def _env_paths(name: str) -> list[Path]:
 
 def _load_fixture(path: Path) -> dict:
     return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def _fixture_to_cuda(fixture: dict) -> dict:
+    moved = {}
+    for key, value in fixture.items():
+        if torch.is_tensor(value):
+            moved[key] = value.cuda().contiguous()
+        else:
+            moved[key] = value
+    return moved
+
+
+def _benchmark_cuda_fixture(
+    fixture: dict,
+    *,
+    warmup: int,
+    iters: int,
+) -> float:
+    gpu_fixture = _fixture_to_cuda(fixture)
+    for _ in range(warmup):
+        ds4_cuda_sparse_attention_from_fixture(gpu_fixture)
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        ds4_cuda_sparse_attention_from_fixture(gpu_fixture)
+    end.record()
+    torch.cuda.synchronize()
+    return float(start.elapsed_time(end)) / max(iters, 1)
 
 
 def _torch_oracle(fixture: dict) -> torch.Tensor:
@@ -65,6 +104,89 @@ def _torch_oracle(fixture: dict) -> torch.Tensor:
 
 
 class TestDS4CudaReferenceAttention(unittest.TestCase):
+    def _assert_cuda_fixture_matches_oracle(
+        self,
+        name: str,
+        fixture: dict,
+        *,
+        atol: float,
+        rtol: float,
+        check_expected: bool,
+    ):
+        actual = ds4_cuda_sparse_attention_from_fixture(fixture).cpu()
+        oracle = _torch_oracle(fixture)
+        results = [
+            compare_tensors(
+                f"cuda_vs_oracle:{name}",
+                actual,
+                oracle,
+                atol=atol,
+                rtol=rtol,
+            )
+        ]
+        if check_expected and "expected" in fixture:
+            results.append(
+                compare_tensors(
+                    f"cuda_vs_expected:{name}",
+                    actual,
+                    fixture["expected"],
+                    atol=atol,
+                    rtol=rtol,
+                )
+            )
+
+        failures = []
+        for result in results:
+            status = "PASS" if result.passed else "FAIL"
+            print(
+                f"{status} {result.name}: shape={list(result.actual_shape)} "
+                f"max_abs={result.max_abs:.6g} max_rel={result.max_rel:.6g} "
+                f"mean_abs={result.mean_abs:.6g} atol={result.atol:g} rtol={result.rtol:g}"
+            )
+            if not result.passed:
+                failures.append(result)
+        return failures
+
+    def test_synthetic_long_fixtures_cuda(self):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is not available")
+
+        atol = float(os.environ.get("DSV4_CUDA_REF_SYNTH_ATOL", "0.01"))
+        rtol = float(os.environ.get("DSV4_CUDA_REF_SYNTH_RTOL", "0.01"))
+        bench_iters = int(os.environ.get("DSV4_CUDA_REF_BENCH_ITERS", "0"))
+        bench_warmup = int(os.environ.get("DSV4_CUDA_REF_BENCH_WARMUP", "5"))
+        failures = []
+        for spec in DEFAULT_LONG_SPECS:
+            fixture = make_synthetic_dsv4_attention_fixture(spec)
+            print(
+                "synthetic fixture "
+                f"{spec.name}: batch={spec.batch} heads={spec.heads} "
+                f"swa_len={spec.swa_len} extra_len={spec.extra_len} "
+                f"row_stride={spec.row_stride}"
+            )
+            failures.extend(
+                self._assert_cuda_fixture_matches_oracle(
+                    spec.name,
+                    fixture,
+                    atol=atol,
+                    rtol=rtol,
+                    check_expected=False,
+                )
+            )
+            if bench_iters > 0:
+                avg_ms = _benchmark_cuda_fixture(
+                    fixture,
+                    warmup=bench_warmup,
+                    iters=bench_iters,
+                )
+                print(f"BENCH cuda_kernel:{spec.name}: avg_ms={avg_ms:.6g}")
+
+        self.assertFalse(
+            failures,
+            "synthetic DS4 CUDA attention replay failed: "
+            + json.dumps([result.__dict__ for result in failures], indent=2, default=str),
+        )
+
     def test_captured_fixtures_cuda(self):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
@@ -85,31 +207,15 @@ class TestDS4CudaReferenceAttention(unittest.TestCase):
         failures = []
         for path in paths:
             fixture = _load_fixture(path)
-            actual = ds4_cuda_sparse_attention_from_fixture(fixture).cpu()
-            oracle = _torch_oracle(fixture)
-            cuda_vs_oracle = compare_tensors(
-                f"cuda_vs_oracle:{path.name}",
-                actual,
-                oracle,
-                atol=atol,
-                rtol=rtol,
-            )
-            cuda_vs_expected = compare_tensors(
-                f"cuda_vs_expected:{path.name}",
-                actual,
-                fixture["expected"],
-                atol=atol,
-                rtol=rtol,
-            )
-            for result in (cuda_vs_oracle, cuda_vs_expected):
-                status = "PASS" if result.passed else "FAIL"
-                print(
-                    f"{status} {result.name}: shape={list(result.actual_shape)} "
-                    f"max_abs={result.max_abs:.6g} max_rel={result.max_rel:.6g} "
-                    f"mean_abs={result.mean_abs:.6g} atol={result.atol:g} rtol={result.rtol:g}"
+            failures.extend(
+                self._assert_cuda_fixture_matches_oracle(
+                    path.name,
+                    fixture,
+                    atol=atol,
+                    rtol=rtol,
+                    check_expected=True,
                 )
-                if not result.passed:
-                    failures.append(result)
+            )
 
         self.assertFalse(
             failures,
