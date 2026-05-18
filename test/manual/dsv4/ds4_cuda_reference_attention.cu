@@ -63,6 +63,7 @@ constexpr int kV23ReduceDimChunks = kHeadDim / kV23ReduceDimChunk;
 static_assert(
     kHeadDim % kV23ReduceDimChunk == 0,
     "v23 expects the head dimension to divide evenly into reduce dim chunks");
+constexpr int kV26TinyTotalWidth = 64;
 constexpr int kReduceScaleCacheMaxRowTiles = 16;
 constexpr int kPartialProfileRowSetup = 0;
 constexpr int kPartialProfileScaleCache = 1;
@@ -106,6 +107,7 @@ enum class AttentionVariant : int {
   kOptimizedV23 = 23,
   kOptimizedV24 = 24,
   kOptimizedV25 = 25,
+  kOptimizedV26 = 26,
 };
 
 const char* attention_variant_name(AttentionVariant variant) {
@@ -160,6 +162,8 @@ const char* attention_variant_name(AttentionVariant variant) {
       return "v24";
     case AttentionVariant::kOptimizedV25:
       return "v25";
+    case AttentionVariant::kOptimizedV26:
+      return "v26";
   }
   return "unknown";
 }
@@ -4043,6 +4047,10 @@ torch::Tensor launch_ds4_cuda_attention(
   dim3 score_block(kScoreThreads);
   dim3 fused_block(kV7Threads);
   dim3 split_block(kV8Threads);
+  if (variant == AttentionVariant::kOptimizedV26) {
+    variant = total_width <= kV26TinyTotalWidth ? AttentionVariant::kOptimizedV5
+                                                : AttentionVariant::kOptimizedV23;
+  }
   switch (variant) {
     case AttentionVariant::kReference:
       ds4_cuda_reference_attention_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
@@ -5897,6 +5905,33 @@ torch::Tensor ds4_cuda_optimized_v25_attention(
       extra_topk_lengths,
       extra_page_size,
       AttentionVariant::kOptimizedV25);
+}
+
+torch::Tensor ds4_cuda_optimized_v26_attention(
+    torch::Tensor q,
+    torch::Tensor swa_k_cache,
+    torch::Tensor swa_indices,
+    torch::Tensor swa_topk_lengths,
+    int64_t swa_page_size,
+    double softmax_scale,
+    torch::Tensor attn_sink,
+    torch::Tensor extra_k_cache,
+    torch::Tensor extra_indices,
+    torch::Tensor extra_topk_lengths,
+    int64_t extra_page_size) {
+  return launch_ds4_cuda_attention(
+      q,
+      swa_k_cache,
+      swa_indices,
+      swa_topk_lengths,
+      swa_page_size,
+      softmax_scale,
+      attn_sink,
+      extra_k_cache,
+      extra_indices,
+      extra_topk_lengths,
+      extra_page_size,
+      AttentionVariant::kOptimizedV26);
 }
 
 torch::Tensor ds4_cuda_reference_scores(
