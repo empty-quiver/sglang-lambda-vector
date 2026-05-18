@@ -29,7 +29,7 @@ def _load_extension():
     os.environ.setdefault("MAX_JOBS", str(os.cpu_count() or 4))
 
     return load(
-        name="ds4_cuda_reference_attention_opt_v5_ext",
+        name="ds4_cuda_reference_attention_opt_v6_ext",
         sources=[
             str(_HERE / "ds4_cuda_reference_attention.cpp"),
             str(_HERE / "ds4_cuda_reference_attention.cu"),
@@ -141,4 +141,67 @@ def ds4_cuda_sparse_attention_from_fixture(
             else None
         ),
         optimized=optimized,
+    )
+
+
+def ds4_cuda_sparse_scores(
+    *,
+    q: torch.Tensor,
+    swa_k_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_topk_lengths: torch.Tensor,
+    swa_page_size: int,
+    softmax_scale: float,
+    extra_k_cache: torch.Tensor | None = None,
+    extra_indices: torch.Tensor | None = None,
+    extra_topk_lengths: torch.Tensor | None = None,
+    extra_page_size: int | None = None,
+    tensor_core: bool = False,
+) -> torch.Tensor:
+    """Run the debug CUDA DS4 pre-softmax QK score kernel."""
+    ext = _load_extension()
+    device = torch.device("cuda")
+    q_cuda = q.to(device=device, dtype=torch.bfloat16, non_blocking=False).contiguous()
+
+    has_extra = extra_k_cache is not None
+    op = ext.ds4_cuda_v6_mma_scores if tensor_core else ext.ds4_cuda_reference_scores
+    return op(
+        q_cuda,
+        _cuda_u8(swa_k_cache, device),
+        _cuda_i32(swa_indices, device),
+        _cuda_i32(swa_topk_lengths, device),
+        int(swa_page_size),
+        float(softmax_scale),
+        _cuda_u8(extra_k_cache, device),
+        _cuda_i32(extra_indices, device),
+        _cuda_i32(extra_topk_lengths, device),
+        int((extra_page_size or 0) if has_extra else 0),
+    )
+
+
+def ds4_cuda_sparse_scores_from_fixture(
+    fixture: dict[str, Any],
+    *,
+    tensor_core: bool = False,
+) -> torch.Tensor:
+    """Run the CUDA QK score kernel using a fixture emitted by the DS4 hook."""
+    if str(fixture.get("layout", "dsv4_packed")) != "dsv4_packed":
+        raise ValueError("CUDA debug kernel only supports dsv4_packed fixtures")
+
+    return ds4_cuda_sparse_scores(
+        q=fixture["q"],
+        swa_k_cache=fixture["swa_k_cache"],
+        swa_indices=fixture["swa_indices"],
+        swa_topk_lengths=fixture["swa_topk_lengths"],
+        swa_page_size=int(fixture["swa_page_size"]),
+        softmax_scale=float(fixture["softmax_scale"]),
+        extra_k_cache=fixture.get("extra_k_cache"),
+        extra_indices=fixture.get("extra_indices"),
+        extra_topk_lengths=fixture.get("extra_topk_lengths"),
+        extra_page_size=(
+            int(fixture["extra_page_size"])
+            if fixture.get("extra_page_size") is not None
+            else None
+        ),
+        tensor_core=tensor_core,
     )

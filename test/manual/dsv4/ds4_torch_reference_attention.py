@@ -199,6 +199,69 @@ def _select_cache_rows(
     return rows, valid
 
 
+def torch_ds4_sparse_scores_ref(
+    *,
+    q: torch.Tensor,
+    swa_k_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_topk_lengths: torch.Tensor,
+    swa_page_size: int,
+    softmax_scale: float,
+    extra_k_cache: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    extra_topk_lengths: Optional[torch.Tensor] = None,
+    extra_page_size: Optional[int] = None,
+    layout: str = "dsv4_packed",
+    fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+    kv_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """Reference pre-softmax DS4 QK scores over SWA + compressed rows."""
+    q_flat, _ = _as_bhk(q)
+    q_flat = q_flat.to(torch.float32)
+
+    swa_rows, swa_valid = _select_cache_rows(
+        swa_k_cache,
+        swa_indices,
+        swa_topk_lengths,
+        swa_page_size,
+        layout=layout,
+        fp8_dtype=fp8_dtype,
+    )
+
+    row_parts = [swa_rows]
+    valid_parts = [swa_valid]
+
+    if extra_k_cache is not None:
+        if extra_indices is None or extra_topk_lengths is None or extra_page_size is None:
+            raise ValueError(
+                "extra_k_cache requires extra_indices, extra_topk_lengths, "
+                "and extra_page_size"
+            )
+        extra_rows, extra_valid = _select_cache_rows(
+            extra_k_cache,
+            extra_indices,
+            extra_topk_lengths,
+            extra_page_size,
+            layout=layout,
+            fp8_dtype=fp8_dtype,
+        )
+        row_parts.append(extra_rows)
+        valid_parts.append(extra_valid)
+
+    kv = torch.cat(row_parts, dim=1)
+    valid = torch.cat(valid_parts, dim=1)
+    if kv_dtype is not None:
+        kv = kv.to(kv_dtype).to(torch.float32)
+
+    if q_flat.shape[0] != kv.shape[0]:
+        raise ValueError(f"q batch {q_flat.shape[0]} != kv batch {kv.shape[0]}")
+    if q_flat.shape[-1] != kv.shape[-1]:
+        raise ValueError(f"q dim {q_flat.shape[-1]} != kv dim {kv.shape[-1]}")
+
+    scores = torch.einsum("bhd,bkd->bhk", q_flat, kv) * softmax_scale
+    return scores.masked_fill(~valid[:, None, :], 0.0)
+
+
 def torch_ds4_sparse_attention_ref(
     *,
     q: torch.Tensor,

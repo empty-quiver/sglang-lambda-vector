@@ -18,6 +18,7 @@ import torch
 
 try:
     from .ds4_cuda_reference_attention import ds4_cuda_sparse_attention_from_fixture
+    from .ds4_cuda_reference_attention import ds4_cuda_sparse_scores_from_fixture
     from .ds4_synthetic_attention_fixtures import DEFAULT_LONG_SPECS
     from .ds4_synthetic_attention_fixtures import (
         make_synthetic_dsv4_attention_fixture,
@@ -25,10 +26,12 @@ try:
     from .ds4_torch_reference_attention import (
         _collect_fixture_paths,
         compare_tensors,
+        torch_ds4_sparse_scores_ref,
         torch_ds4_sparse_attention_ref,
     )
 except ImportError:
     from ds4_cuda_reference_attention import ds4_cuda_sparse_attention_from_fixture  # type: ignore
+    from ds4_cuda_reference_attention import ds4_cuda_sparse_scores_from_fixture  # type: ignore
     from ds4_synthetic_attention_fixtures import DEFAULT_LONG_SPECS  # type: ignore
     from ds4_synthetic_attention_fixtures import (  # type: ignore
         make_synthetic_dsv4_attention_fixture,
@@ -36,6 +39,7 @@ except ImportError:
     from ds4_torch_reference_attention import (  # type: ignore
         _collect_fixture_paths,
         compare_tensors,
+        torch_ds4_sparse_scores_ref,
         torch_ds4_sparse_attention_ref,
     )
 
@@ -86,6 +90,28 @@ def _benchmark_cuda_fixture(
     return float(start.elapsed_time(end)) / max(iters, 1)
 
 
+def _benchmark_cuda_scores_fixture(
+    fixture: dict,
+    *,
+    warmup: int,
+    iters: int,
+    tensor_core: bool,
+) -> float:
+    gpu_fixture = _fixture_to_cuda(fixture)
+    for _ in range(warmup):
+        ds4_cuda_sparse_scores_from_fixture(gpu_fixture, tensor_core=tensor_core)
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        ds4_cuda_sparse_scores_from_fixture(gpu_fixture, tensor_core=tensor_core)
+    end.record()
+    torch.cuda.synchronize()
+    return float(start.elapsed_time(end)) / max(iters, 1)
+
+
 def _torch_oracle(fixture: dict) -> torch.Tensor:
     return torch_ds4_sparse_attention_ref(
         q=fixture["q"],
@@ -107,7 +133,82 @@ def _torch_oracle(fixture: dict) -> torch.Tensor:
     )
 
 
+def _torch_scores(fixture: dict, *, kv_dtype: torch.dtype | None = None) -> torch.Tensor:
+    return torch_ds4_sparse_scores_ref(
+        q=fixture["q"],
+        swa_k_cache=fixture["swa_k_cache"],
+        swa_indices=fixture["swa_indices"],
+        swa_topk_lengths=fixture["swa_topk_lengths"],
+        swa_page_size=int(fixture["swa_page_size"]),
+        softmax_scale=float(fixture["softmax_scale"]),
+        extra_k_cache=fixture.get("extra_k_cache"),
+        extra_indices=fixture.get("extra_indices"),
+        extra_topk_lengths=fixture.get("extra_topk_lengths"),
+        extra_page_size=(
+            int(fixture["extra_page_size"])
+            if fixture.get("extra_page_size") is not None
+            else None
+        ),
+        layout=str(fixture.get("layout", "dsv4_packed")),
+        kv_dtype=kv_dtype,
+    )
+
+
 class TestDS4CudaReferenceAttention(unittest.TestCase):
+    def _assert_cuda_scores_match_reference(
+        self,
+        name: str,
+        fixture: dict,
+        *,
+        atol: float,
+        rtol: float,
+    ):
+        scalar = ds4_cuda_sparse_scores_from_fixture(
+            fixture,
+            tensor_core=False,
+        ).cpu()
+        mma = ds4_cuda_sparse_scores_from_fixture(
+            fixture,
+            tensor_core=True,
+        ).cpu()
+        torch_scores = _torch_scores(fixture)
+        torch_scores_bf16_k = _torch_scores(fixture, kv_dtype=torch.bfloat16)
+        results = [
+            compare_tensors(
+                f"scores_scalar_vs_torch:{name}",
+                scalar,
+                torch_scores,
+                atol=atol,
+                rtol=rtol,
+            ),
+            compare_tensors(
+                f"scores_v6_mma_vs_torch_bf16_k:{name}",
+                mma,
+                torch_scores_bf16_k,
+                atol=atol,
+                rtol=rtol,
+            ),
+            compare_tensors(
+                f"scores_v6_mma_vs_scalar:{name}",
+                mma,
+                scalar,
+                atol=atol,
+                rtol=rtol,
+            ),
+        ]
+
+        failures = []
+        for result in results:
+            status = "PASS" if result.passed else "FAIL"
+            print(
+                f"{status} {result.name}: shape={list(result.actual_shape)} "
+                f"max_abs={result.max_abs:.6g} max_rel={result.max_rel:.6g} "
+                f"mean_abs={result.mean_abs:.6g} atol={result.atol:g} rtol={result.rtol:g}"
+            )
+            if not result.passed:
+                failures.append(result)
+        return failures
+
     def _assert_cuda_fixture_matches_oracle(
         self,
         name: str,
@@ -186,6 +287,8 @@ class TestDS4CudaReferenceAttention(unittest.TestCase):
 
         atol = float(os.environ.get("DSV4_CUDA_REF_SYNTH_ATOL", "0.01"))
         rtol = float(os.environ.get("DSV4_CUDA_REF_SYNTH_RTOL", "0.01"))
+        score_atol = float(os.environ.get("DSV4_CUDA_SCORE_ATOL", "0.05"))
+        score_rtol = float(os.environ.get("DSV4_CUDA_SCORE_RTOL", "0.05"))
         bench_iters = int(os.environ.get("DSV4_CUDA_REF_BENCH_ITERS", "0"))
         bench_warmup = int(os.environ.get("DSV4_CUDA_REF_BENCH_WARMUP", "5"))
         failures = []
@@ -204,6 +307,14 @@ class TestDS4CudaReferenceAttention(unittest.TestCase):
                     atol=atol,
                     rtol=rtol,
                     check_expected=False,
+                )
+            )
+            failures.extend(
+                self._assert_cuda_scores_match_reference(
+                    spec.name,
+                    fixture,
+                    atol=score_atol,
+                    rtol=score_rtol,
                 )
             )
             if bench_iters > 0:
@@ -228,6 +339,26 @@ class TestDS4CudaReferenceAttention(unittest.TestCase):
                         f"BENCH cuda_optimized_{variant}:{spec.name}: "
                         f"avg_ms={opt_ms:.6g} speedup={speedup:.3f}x"
                     )
+                score_ref_ms = _benchmark_cuda_scores_fixture(
+                    fixture,
+                    warmup=bench_warmup,
+                    iters=bench_iters,
+                    tensor_core=False,
+                )
+                score_mma_ms = _benchmark_cuda_scores_fixture(
+                    fixture,
+                    warmup=bench_warmup,
+                    iters=bench_iters,
+                    tensor_core=True,
+                )
+                score_speedup = score_ref_ms / score_mma_ms if score_mma_ms else float("inf")
+                print(
+                    f"BENCH cuda_scores_reference:{spec.name}: avg_ms={score_ref_ms:.6g}"
+                )
+                print(
+                    f"BENCH cuda_scores_v6_mma:{spec.name}: "
+                    f"avg_ms={score_mma_ms:.6g} speedup={score_speedup:.3f}x"
+                )
 
         self.assertFalse(
             failures,
@@ -252,6 +383,8 @@ class TestDS4CudaReferenceAttention(unittest.TestCase):
 
         atol = float(os.environ.get("DSV4_CUDA_REF_ATOL", "0.05"))
         rtol = float(os.environ.get("DSV4_CUDA_REF_RTOL", "0.05"))
+        score_atol = float(os.environ.get("DSV4_CUDA_SCORE_ATOL", "0.05"))
+        score_rtol = float(os.environ.get("DSV4_CUDA_SCORE_RTOL", "0.05"))
         failures = []
         for path in paths:
             fixture = _load_fixture(path)
@@ -262,6 +395,14 @@ class TestDS4CudaReferenceAttention(unittest.TestCase):
                     atol=atol,
                     rtol=rtol,
                     check_expected=True,
+                )
+            )
+            failures.extend(
+                self._assert_cuda_scores_match_reference(
+                    path.name,
+                    fixture,
+                    atol=score_atol,
+                    rtol=score_rtol,
                 )
             )
 

@@ -1,6 +1,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
+#include <mma.h>
 #include <torch/extension.h>
 
 #include <cmath>
@@ -27,6 +28,13 @@ constexpr int kV4WarpsPerHead = 2;
 constexpr int kV4HeadsPerBlock = kWarps / kV4WarpsPerHead;
 constexpr int kV4HeadThreads = kV4WarpsPerHead * 32;
 constexpr int kV4DimsPerThread = kHeadDim / kV4HeadThreads;
+constexpr int kScoreTileM = 16;
+constexpr int kScoreTileN = 16;
+constexpr int kScoreTileK = 16;
+constexpr int kScoreTileElems = kScoreTileM * kScoreTileN;
+constexpr int kScoreWarpsPerBlock = 4;
+constexpr int kScoreRowsPerBlock = kScoreTileN * kScoreWarpsPerBlock;
+constexpr int kScoreThreads = 32 * kScoreWarpsPerBlock;
 
 enum class AttentionVariant : int {
   kReference = 0,
@@ -206,6 +214,67 @@ __device__ __forceinline__ const uint8_t* selected_row_ptr(
     token = index - page * page_size;
   }
   return cache + (static_cast<int64_t>(page) * page_size + token) * row_stride;
+}
+
+__device__ __forceinline__ int clamped_length(
+    const int32_t* lengths,
+    int batch,
+    int width) {
+  int len = lengths[batch];
+  if (len < 0) {
+    len = 0;
+  }
+  if (len > width) {
+    len = width;
+  }
+  return len;
+}
+
+__device__ __forceinline__ const uint8_t* selected_combined_row_ptr(
+    const uint8_t* swa_cache,
+    const int32_t* swa_indices,
+    const int32_t* swa_lengths,
+    int swa_width,
+    int swa_page_size,
+    int swa_row_stride,
+    const uint8_t* extra_cache,
+    const int32_t* extra_indices,
+    const int32_t* extra_lengths,
+    int extra_width,
+    int extra_page_size,
+    int extra_row_stride,
+    bool has_extra,
+    int batch,
+    int row,
+    bool& valid) {
+  if (row < swa_width) {
+    valid = row < clamped_length(swa_lengths, batch, swa_width);
+    return valid ? selected_row_ptr(
+                       swa_cache,
+                       swa_indices,
+                       swa_width,
+                       swa_page_size,
+                       swa_row_stride,
+                       batch,
+                       row)
+                 : nullptr;
+  }
+
+  const int extra_row = row - swa_width;
+  if (!has_extra || extra_row >= extra_width) {
+    valid = false;
+    return nullptr;
+  }
+  valid = extra_row < clamped_length(extra_lengths, batch, extra_width);
+  return valid ? selected_row_ptr(
+                     extra_cache,
+                     extra_indices,
+                     extra_width,
+                     extra_page_size,
+                     extra_row_stride,
+                     batch,
+                     extra_row)
+               : nullptr;
 }
 
 __device__ __forceinline__ void consume_row(
@@ -1041,6 +1110,202 @@ __global__ void ds4_cuda_grouped_head_attention_kernel(
   }
 }
 
+__global__ void ds4_cuda_scores_reference_kernel(
+    const __nv_bfloat16* __restrict__ q,
+    const uint8_t* __restrict__ swa_cache,
+    const int32_t* __restrict__ swa_indices,
+    const int32_t* __restrict__ swa_lengths,
+    int swa_width,
+    int swa_page_size,
+    int swa_row_stride,
+    const uint8_t* __restrict__ extra_cache,
+    const int32_t* __restrict__ extra_indices,
+    const int32_t* __restrict__ extra_lengths,
+    int extra_width,
+    int extra_page_size,
+    int extra_row_stride,
+    bool has_extra,
+    float softmax_scale,
+    int batch_size,
+    int num_heads,
+    int total_width,
+    float* __restrict__ out) {
+  const int batch = blockIdx.x;
+  const int head = blockIdx.y;
+  const int row = blockIdx.z;
+  if (batch >= batch_size || head >= num_heads || row >= total_width) {
+    return;
+  }
+
+  bool valid = false;
+  const uint8_t* packed = selected_combined_row_ptr(
+      swa_cache,
+      swa_indices,
+      swa_lengths,
+      swa_width,
+      swa_page_size,
+      swa_row_stride,
+      extra_cache,
+      extra_indices,
+      extra_lengths,
+      extra_width,
+      extra_page_size,
+      extra_row_stride,
+      has_extra,
+      batch,
+      row,
+      valid);
+
+  if (!valid) {
+    if (threadIdx.x == 0) {
+      out[(static_cast<int64_t>(batch) * num_heads + head) * total_width + row] = 0.0f;
+    }
+    return;
+  }
+
+  __shared__ float shared[kOptimizedV5SharedFloats];
+
+  const int tid = threadIdx.x;
+  const int dim0 = tid;
+  const int dim1 = tid + kThreads;
+  const int64_t q_base = (static_cast<int64_t>(batch) * num_heads + head) * kHeadDim;
+
+  float dot_part = 0.0f;
+  if (dim0 < kHeadDim) {
+    dot_part += __bfloat162float(q[q_base + dim0]) * load_dsv4_packed_dim(packed, dim0);
+  }
+  if (dim1 < kHeadDim) {
+    dot_part += __bfloat162float(q[q_base + dim1]) * load_dsv4_packed_dim(packed, dim1);
+  }
+
+  reduce_sum_warp_block_total_slot(shared, dot_part);
+  if (threadIdx.x == 0) {
+    out[(static_cast<int64_t>(batch) * num_heads + head) * total_width + row] =
+        dot_part * softmax_scale;
+  }
+}
+
+__global__ void ds4_cuda_scores_v6_mma_kernel(
+    const __nv_bfloat16* __restrict__ q,
+    const uint8_t* __restrict__ swa_cache,
+    const int32_t* __restrict__ swa_indices,
+    const int32_t* __restrict__ swa_lengths,
+    int swa_width,
+    int swa_page_size,
+    int swa_row_stride,
+    const uint8_t* __restrict__ extra_cache,
+    const int32_t* __restrict__ extra_indices,
+    const int32_t* __restrict__ extra_lengths,
+    int extra_width,
+    int extra_page_size,
+    int extra_row_stride,
+    bool has_extra,
+    float softmax_scale,
+    int batch_size,
+    int num_heads,
+    int total_width,
+    float* __restrict__ out) {
+  namespace wmma = nvcuda::wmma;
+
+  const int batch = blockIdx.x;
+  const int head_base = blockIdx.y * kScoreTileM;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int row_base = (blockIdx.z * kScoreWarpsPerBlock + warp) * kScoreTileN;
+  if (batch >= batch_size) {
+    return;
+  }
+
+  __shared__ __align__(16) __nv_bfloat16
+      q_shared[kScoreWarpsPerBlock][kScoreTileM * kScoreTileK];
+  __shared__ __align__(16) __nv_bfloat16
+      k_shared[kScoreWarpsPerBlock][kScoreTileK * kScoreTileN];
+  __shared__ __align__(16) float score_shared[kScoreWarpsPerBlock][kScoreTileElems];
+
+  wmma::fragment<wmma::matrix_a, kScoreTileM, kScoreTileN, kScoreTileK, __nv_bfloat16, wmma::row_major>
+      q_frag;
+  wmma::fragment<wmma::matrix_b, kScoreTileM, kScoreTileN, kScoreTileK, __nv_bfloat16, wmma::row_major>
+      k_frag;
+  wmma::fragment<wmma::accumulator, kScoreTileM, kScoreTileN, kScoreTileK, float>
+      acc_frag;
+  wmma::fill_fragment(acc_frag, 0.0f);
+
+  for (int dim_base = 0; dim_base < kHeadDim; dim_base += kScoreTileK) {
+    for (int idx = lane; idx < kScoreTileElems; idx += 32) {
+      const int q_head_slot = idx / kScoreTileK;
+      const int q_dim_slot = idx - q_head_slot * kScoreTileK;
+      const int head = head_base + q_head_slot;
+      const int dim = dim_base + q_dim_slot;
+      const int64_t q_offset =
+          (static_cast<int64_t>(batch) * num_heads + head) * kHeadDim + dim;
+      q_shared[warp][idx] = head < num_heads ? q[q_offset] : __float2bfloat16(0.0f);
+
+      const int k_dim_slot = idx / kScoreTileN;
+      const int k_row_slot = idx - k_dim_slot * kScoreTileN;
+      const int row = row_base + k_row_slot;
+      bool valid = false;
+      const uint8_t* packed = selected_combined_row_ptr(
+          swa_cache,
+          swa_indices,
+          swa_lengths,
+          swa_width,
+          swa_page_size,
+          swa_row_stride,
+          extra_cache,
+          extra_indices,
+          extra_lengths,
+          extra_width,
+          extra_page_size,
+          extra_row_stride,
+          has_extra,
+          batch,
+          row,
+          valid);
+      const float value =
+          valid && row < total_width ? load_dsv4_packed_dim(packed, dim_base + k_dim_slot) : 0.0f;
+      k_shared[warp][idx] = __float2bfloat16(value);
+    }
+    __syncwarp();
+
+    wmma::load_matrix_sync(q_frag, q_shared[warp], kScoreTileK);
+    wmma::load_matrix_sync(k_frag, k_shared[warp], kScoreTileN);
+    wmma::mma_sync(acc_frag, q_frag, k_frag, acc_frag);
+    __syncwarp();
+  }
+
+  wmma::store_matrix_sync(score_shared[warp], acc_frag, kScoreTileN, wmma::mem_row_major);
+  __syncwarp();
+
+  for (int idx = lane; idx < kScoreTileElems; idx += 32) {
+    const int head_slot = idx / kScoreTileN;
+    const int row_slot = idx - head_slot * kScoreTileN;
+    const int head = head_base + head_slot;
+    const int row = row_base + row_slot;
+    if (head < num_heads && row < total_width) {
+      bool valid = false;
+      selected_combined_row_ptr(
+          swa_cache,
+          swa_indices,
+          swa_lengths,
+          swa_width,
+          swa_page_size,
+          swa_row_stride,
+          extra_cache,
+          extra_indices,
+          extra_lengths,
+          extra_width,
+          extra_page_size,
+          extra_row_stride,
+          has_extra,
+          batch,
+          row,
+          valid);
+      out[(static_cast<int64_t>(batch) * num_heads + head) * total_width + row] =
+          valid ? score_shared[warp][idx] * softmax_scale : 0.0f;
+    }
+  }
+}
+
 int64_t flattened_batch(torch::Tensor q) {
   TORCH_CHECK(q.dim() >= 3, "q must have shape [..., heads, 512], got ", q.sizes());
   TORCH_CHECK(q.size(-1) == kHeadDim, "q head dim must be 512, got ", q.size(-1));
@@ -1274,6 +1539,126 @@ torch::Tensor launch_ds4_cuda_attention(
   return out;
 }
 
+torch::Tensor launch_ds4_cuda_scores(
+    torch::Tensor q,
+    torch::Tensor swa_k_cache,
+    torch::Tensor swa_indices,
+    torch::Tensor swa_topk_lengths,
+    int64_t swa_page_size,
+    double softmax_scale,
+    torch::Tensor extra_k_cache,
+    torch::Tensor extra_indices,
+    torch::Tensor extra_topk_lengths,
+    int64_t extra_page_size,
+    bool tensor_core) {
+  TORCH_CHECK(q.is_cuda(), "q must be CUDA");
+  TORCH_CHECK(q.scalar_type() == torch::kBFloat16, "q must be bfloat16");
+  TORCH_CHECK(swa_k_cache.is_cuda(), "swa_k_cache must be CUDA");
+  TORCH_CHECK(swa_k_cache.scalar_type() == torch::kUInt8, "swa_k_cache must be uint8");
+  TORCH_CHECK(swa_indices.is_cuda(), "swa_indices must be CUDA");
+  TORCH_CHECK(swa_topk_lengths.is_cuda(), "swa_topk_lengths must be CUDA");
+  TORCH_CHECK(swa_indices.scalar_type() == torch::kInt32, "swa_indices must be int32");
+  TORCH_CHECK(swa_topk_lengths.scalar_type() == torch::kInt32, "swa_topk_lengths must be int32");
+  TORCH_CHECK(swa_k_cache.dim() == 4, "swa_k_cache must be [pages, page, 1, bytes]");
+  TORCH_CHECK(swa_k_cache.size(2) == 1, "swa_k_cache singleton dim must be 1");
+  TORCH_CHECK(swa_k_cache.size(3) >= kPackedBytes, "swa_k_cache packed dim is too small");
+  TORCH_CHECK(swa_indices.dim() >= 2, "swa_indices must have at least 2 dims");
+
+  q = q.contiguous();
+  swa_k_cache = swa_k_cache.contiguous();
+  swa_indices = swa_indices.contiguous();
+  swa_topk_lengths = swa_topk_lengths.contiguous();
+  extra_k_cache = extra_k_cache.contiguous();
+  extra_indices = extra_indices.contiguous();
+  extra_topk_lengths = extra_topk_lengths.contiguous();
+
+  const auto batch_size = flattened_batch(q);
+  const auto num_heads = q.size(-2);
+  const auto swa_width = swa_indices.size(-1);
+  TORCH_CHECK(swa_topk_lengths.numel() == batch_size, "swa lengths must match flattened q batch");
+  TORCH_CHECK(swa_indices.numel() / swa_width == batch_size, "swa indices must match flattened q batch");
+
+  const bool has_extra = extra_k_cache.numel() > 0;
+  int64_t extra_width = 0;
+  if (has_extra) {
+    TORCH_CHECK(extra_k_cache.is_cuda(), "extra_k_cache must be CUDA when provided");
+    TORCH_CHECK(extra_k_cache.scalar_type() == torch::kUInt8, "extra_k_cache must be uint8");
+    TORCH_CHECK(extra_indices.is_cuda(), "extra_indices must be CUDA when provided");
+    TORCH_CHECK(extra_topk_lengths.is_cuda(), "extra_topk_lengths must be CUDA when provided");
+    TORCH_CHECK(extra_indices.scalar_type() == torch::kInt32, "extra_indices must be int32");
+    TORCH_CHECK(extra_topk_lengths.scalar_type() == torch::kInt32, "extra_topk_lengths must be int32");
+    TORCH_CHECK(extra_k_cache.dim() == 4, "extra_k_cache must be [pages, page, 1, bytes]");
+    TORCH_CHECK(extra_k_cache.size(2) == 1, "extra_k_cache singleton dim must be 1");
+    TORCH_CHECK(extra_k_cache.size(3) >= kPackedBytes, "extra_k_cache packed dim is too small");
+    TORCH_CHECK(extra_indices.dim() >= 2, "extra_indices must have at least 2 dims");
+    extra_width = extra_indices.size(-1);
+    TORCH_CHECK(extra_topk_lengths.numel() == batch_size, "extra lengths must match flattened q batch");
+    TORCH_CHECK(extra_indices.numel() / extra_width == batch_size, "extra indices must match flattened q batch");
+  }
+
+  const int64_t total_width = swa_width + extra_width;
+  auto out = torch::empty(
+      {batch_size, num_heads, total_width},
+      q.options().dtype(torch::kFloat32));
+
+  c10::cuda::CUDAGuard device_guard(q.device());
+  if (tensor_core) {
+    dim3 grid(
+        static_cast<unsigned int>(batch_size),
+        static_cast<unsigned int>((num_heads + kScoreTileM - 1) / kScoreTileM),
+        static_cast<unsigned int>((total_width + kScoreRowsPerBlock - 1) / kScoreRowsPerBlock));
+    dim3 block(kScoreThreads);
+    ds4_cuda_scores_v6_mma_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
+        swa_k_cache.data_ptr<uint8_t>(),
+        swa_indices.data_ptr<int32_t>(),
+        swa_topk_lengths.data_ptr<int32_t>(),
+        static_cast<int>(swa_width),
+        static_cast<int>(swa_page_size),
+        static_cast<int>(swa_k_cache.size(3)),
+        has_extra ? extra_k_cache.data_ptr<uint8_t>() : nullptr,
+        has_extra ? extra_indices.data_ptr<int32_t>() : nullptr,
+        has_extra ? extra_topk_lengths.data_ptr<int32_t>() : nullptr,
+        static_cast<int>(extra_width),
+        static_cast<int>(extra_page_size),
+        has_extra ? static_cast<int>(extra_k_cache.size(3)) : 0,
+        has_extra,
+        static_cast<float>(softmax_scale),
+        static_cast<int>(batch_size),
+        static_cast<int>(num_heads),
+        static_cast<int>(total_width),
+        out.data_ptr<float>());
+  } else {
+    dim3 grid(
+        static_cast<unsigned int>(batch_size),
+        static_cast<unsigned int>(num_heads),
+        static_cast<unsigned int>(total_width));
+    dim3 block(kThreads);
+    ds4_cuda_scores_reference_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
+        swa_k_cache.data_ptr<uint8_t>(),
+        swa_indices.data_ptr<int32_t>(),
+        swa_topk_lengths.data_ptr<int32_t>(),
+        static_cast<int>(swa_width),
+        static_cast<int>(swa_page_size),
+        static_cast<int>(swa_k_cache.size(3)),
+        has_extra ? extra_k_cache.data_ptr<uint8_t>() : nullptr,
+        has_extra ? extra_indices.data_ptr<int32_t>() : nullptr,
+        has_extra ? extra_topk_lengths.data_ptr<int32_t>() : nullptr,
+        static_cast<int>(extra_width),
+        static_cast<int>(extra_page_size),
+        has_extra ? static_cast<int>(extra_k_cache.size(3)) : 0,
+        has_extra,
+        static_cast<float>(softmax_scale),
+        static_cast<int>(batch_size),
+        static_cast<int>(num_heads),
+        static_cast<int>(total_width),
+        out.data_ptr<float>());
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
 }  // namespace
 
 torch::Tensor ds4_cuda_reference_attention(
@@ -1436,4 +1821,54 @@ torch::Tensor ds4_cuda_optimized_v5_attention(
       extra_topk_lengths,
       extra_page_size,
       AttentionVariant::kOptimizedV5);
+}
+
+torch::Tensor ds4_cuda_reference_scores(
+    torch::Tensor q,
+    torch::Tensor swa_k_cache,
+    torch::Tensor swa_indices,
+    torch::Tensor swa_topk_lengths,
+    int64_t swa_page_size,
+    double softmax_scale,
+    torch::Tensor extra_k_cache,
+    torch::Tensor extra_indices,
+    torch::Tensor extra_topk_lengths,
+    int64_t extra_page_size) {
+  return launch_ds4_cuda_scores(
+      q,
+      swa_k_cache,
+      swa_indices,
+      swa_topk_lengths,
+      swa_page_size,
+      softmax_scale,
+      extra_k_cache,
+      extra_indices,
+      extra_topk_lengths,
+      extra_page_size,
+      false);
+}
+
+torch::Tensor ds4_cuda_v6_mma_scores(
+    torch::Tensor q,
+    torch::Tensor swa_k_cache,
+    torch::Tensor swa_indices,
+    torch::Tensor swa_topk_lengths,
+    int64_t swa_page_size,
+    double softmax_scale,
+    torch::Tensor extra_k_cache,
+    torch::Tensor extra_indices,
+    torch::Tensor extra_topk_lengths,
+    int64_t extra_page_size) {
+  return launch_ds4_cuda_scores(
+      q,
+      swa_k_cache,
+      swa_indices,
+      swa_topk_lengths,
+      swa_page_size,
+      softmax_scale,
+      extra_k_cache,
+      extra_indices,
+      extra_topk_lengths,
+      extra_page_size,
+      true);
 }
