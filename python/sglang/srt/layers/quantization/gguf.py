@@ -185,6 +185,8 @@ def _gguf_trace_layer_enabled(debug_layer: Optional[int]) -> bool:
 
 
 def _gguf_trace_enabled(debug_layer: Optional[int] = None) -> bool:
+    if _is_cuda and torch.cuda.is_current_stream_capturing():
+        return False
     return _gguf_env_enabled("SGLANG_GGUF_MOE_TRACE") and _gguf_trace_layer_enabled(
         debug_layer
     )
