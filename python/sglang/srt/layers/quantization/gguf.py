@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 import warnings
 from typing import TYPE_CHECKING, Any, List, Optional
 
@@ -170,10 +171,77 @@ DEQUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
 
+_GGUF_TRACE_COUNT = 0
+
+
+def _gguf_env_enabled(name: str) -> bool:
+    value = os.getenv(name, "")
+    return value.lower() not in ("", "0", "false", "no", "off")
+
+
+def _gguf_trace_layer_enabled(debug_layer: Optional[int]) -> bool:
+    target = os.getenv("SGLANG_GGUF_MOE_TRACE_LAYER")
+    return target is None or debug_layer is None or str(debug_layer) == target
+
+
+def _gguf_trace_enabled(debug_layer: Optional[int] = None) -> bool:
+    return _gguf_env_enabled("SGLANG_GGUF_MOE_TRACE") and _gguf_trace_layer_enabled(
+        debug_layer
+    )
+
+
+def _gguf_trace_sync():
+    if (
+        _gguf_env_enabled("SGLANG_GGUF_MOE_TRACE_SYNC")
+        and torch.cuda.is_available()
+    ):
+        torch.cuda.synchronize()
+
+
+def _gguf_trace_start(enabled: bool) -> Optional[float]:
+    if not enabled:
+        return None
+    _gguf_trace_sync()
+    return time.perf_counter()
+
+
+def _gguf_quant_type_to_int(qweight_type: int) -> int:
+    if isinstance(qweight_type, torch.Tensor):
+        return int(qweight_type.item())
+    return int(qweight_type)
+
+
+def _gguf_quant_type_name(qweight_type: int) -> str:
+    qtype = _gguf_quant_type_to_int(qweight_type)
+    try:
+        return WeightType(qtype).name
+    except ValueError:
+        return f"UNKNOWN_{qtype}"
+
+
+def _gguf_trace_print(tag: str, message: str):
+    global _GGUF_TRACE_COUNT
+
+    limit = int(os.getenv("SGLANG_GGUF_MOE_TRACE_LIMIT", "256"))
+    if limit >= 0 and _GGUF_TRACE_COUNT >= limit:
+        return
+    _GGUF_TRACE_COUNT += 1
+    print(f"[{tag} #{_GGUF_TRACE_COUNT}] {message}", flush=True)
+
+
+def _gguf_trace_elapsed_ms(start: Optional[float]) -> str:
+    if start is None:
+        return "n/a"
+    _gguf_trace_sync()
+    return f"{(time.perf_counter() - start) * 1000.0:.3f}"
+
 
 def fused_mul_mat_gguf(
     x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
 ) -> torch.Tensor:
+    trace_enabled = _gguf_trace_enabled()
+    trace_start = _gguf_trace_start(trace_enabled)
+    branch = "unknown"
     if qweight_type in IMATRIX_QUANT_TYPES:
         mmvq_safe = 8 if qweight.shape[0] > 5120 else 16
     else:
@@ -181,20 +249,25 @@ def fused_mul_mat_gguf(
     # HACK: when doing chunked prefill we don't generate output tokens
     # so input to logits generator is empty which causes invalid parameter
     if x.shape[0] == 0:
+        branch = "empty"
         return torch.empty(x.shape[0], qweight.shape[0], dtype=x.dtype, device=x.device)
     # there is no need to call any kernel for fp16/bf16
     if qweight_type in UNQUANTIZED_TYPES:
+        branch = "unquantized"
         if qweight.dtype != x.dtype:
             qweight = qweight.to(dtype=x.dtype)
-        return x @ qweight.T
+        y = x @ qweight.T
     # enable MMVQ in contiguous batching with batch_size=1
-    if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
+    elif x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
+        branch = "mmvq"
         y = ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
     # Use MMQ Kernel if it's available (standard + k-quants)
     elif qweight_type in MMQ_QUANT_TYPES:
+        branch = "mmq"
         y = ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
     # If there is no available MMQ kernel, fallback to dequantize
     elif qweight_type in DEQUANT_TYPES:
+        branch = "dequant_fallback"
         block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
         shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
         weight = ggml_dequantize(qweight, qweight_type, *shape, x.dtype)
@@ -205,13 +278,15 @@ def fused_mul_mat_gguf(
         # Wrap to GGMLQuantizationType IntEnum to make sure it's a valid type.
         qweight_type = WeightType(qweight_type)
         raise NotImplementedError(f"Unsupported GGUF quantization type: {qweight_type}")
+    if trace_enabled:
+        _gguf_trace_print(
+            "GGUF_MATMUL_TRACE",
+            f"branch={branch} elapsed_ms={_gguf_trace_elapsed_ms(trace_start)} "
+            f"x={tuple(x.shape)} qweight={tuple(qweight.shape)} "
+            f"qtype={_gguf_quant_type_name(qweight_type)} out={tuple(y.shape)} "
+            f"mmvq_safe={mmvq_safe}",
+        )
     return y
-
-
-def _gguf_quant_type_to_int(qweight_type: int) -> int:
-    if isinstance(qweight_type, torch.Tensor):
-        return int(qweight_type.item())
-    return int(qweight_type)
 
 
 def _gguf_moe_block_size(qweight_type: int) -> int:
@@ -237,6 +312,30 @@ def fused_moe_gguf(
         elif activation == "gelu":
             return gelu_and_mul(x)
         raise ValueError(f"Unsupported activation: {activation}")
+
+    trace_enabled = _gguf_trace_enabled(debug_layer)
+    trace_start = _gguf_trace_start(trace_enabled)
+
+    def trace_done(branch: str, extra: str = ""):
+        if not trace_enabled:
+            return
+        if topk_ids.numel() > 0:
+            topk_min = int(topk_ids.min().item())
+            topk_max = int(topk_ids.max().item())
+            topk_range = f"topk_minmax=({topk_min},{topk_max})"
+        else:
+            topk_range = "topk_minmax=(empty)"
+        suffix = f" {extra}" if extra else ""
+        _gguf_trace_print(
+            "GGUF_MOE_TRACE",
+            f"layer={debug_layer} branch={branch} "
+            f"elapsed_ms={_gguf_trace_elapsed_ms(trace_start)} "
+            f"x={tuple(x.shape)} w1={tuple(w1.shape)} w2={tuple(w2.shape)} "
+            f"topk={tuple(topk_ids.shape)} {topk_range} "
+            f"qtypes=({_gguf_quant_type_name(qweight_type)},"
+            f"{_gguf_quant_type_name(qweight_type2)}) "
+            f"activation={activation}{suffix}",
+        )
 
     out_hidden_states = torch.empty_like(x)
     if not (_is_cuda and torch.cuda.is_current_stream_capturing()) and torch.any(
@@ -271,6 +370,10 @@ def fused_moe_gguf(
             debug_layer=debug_layer,
         )
         out_hidden_states.index_add_(0, active_token_ids, active_out)
+        trace_done(
+            "active_filter",
+            f"active_tokens={active_tokens} original_tokens={num_tokens}",
+        )
         return out_hidden_states
 
     # unless we decent expert reuse we are better off running moe_vec kernel
@@ -456,6 +559,10 @@ def fused_moe_gguf(
             print(f"[GGUF_MOE_SYNC post_moe_sum] layer={debug_layer}", flush=True)
             torch.cuda.synchronize()
             print(f"[GGUF_MOE_SYNC post_moe_sum_sync_ok] layer={debug_layer}", flush=True)
+        trace_done(
+            "mmq_sorted",
+            f"block={BLOCK_SIZE} post_padded={int(num_tokens_post_padded.item())}",
+        )
     elif qweight_type2 in MMVQ_QUANT_TYPES and qweight_type in MMVQ_QUANT_TYPES:
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
@@ -471,6 +578,7 @@ def fused_moe_gguf(
             topk_weights.view(num_tokens, top_k, 1)
         )
         moe_sum(out, out_hidden_states)
+        trace_done("mmvq_vec", f"num_tokens={num_tokens} top_k={top_k} hidden={N}")
     else:
         logger.warning_once(
             "There is no support for fast MoE kernel "
@@ -495,6 +603,7 @@ def fused_moe_gguf(
                 else:
                     current_hidden_state.add_(current_state)
             out_hidden_states[tok] = current_hidden_state
+        trace_done("slow_fallback", f"num_tokens={x.shape[0]} top_k={topk_ids.shape[1]}")
     return out_hidden_states
 
 
