@@ -143,6 +143,19 @@ torch::Tensor ds4_cuda_optimized_v11_attention(
     torch::Tensor extra_topk_lengths,
     int64_t extra_page_size);
 
+torch::Tensor ds4_cuda_optimized_v12_attention(
+    torch::Tensor q,
+    torch::Tensor swa_k_cache,
+    torch::Tensor swa_indices,
+    torch::Tensor swa_topk_lengths,
+    int64_t swa_page_size,
+    double softmax_scale,
+    torch::Tensor attn_sink,
+    torch::Tensor extra_k_cache,
+    torch::Tensor extra_indices,
+    torch::Tensor extra_topk_lengths,
+    int64_t extra_page_size);
+
 torch::Tensor ds4_cuda_reference_scores(
     torch::Tensor q,
     torch::Tensor swa_k_cache,
@@ -212,6 +225,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "ds4_cuda_optimized_v11_attention",
       &ds4_cuda_optimized_v11_attention,
       "Debug CUDA DS4 sparse attention optimized v11 parallel tensor-core P@V");
+  m.def(
+      "ds4_cuda_optimized_v12_attention",
+      &ds4_cuda_optimized_v12_attention,
+      "Debug CUDA DS4 sparse attention optimized v12 cached-P tensor-core P@V");
   m.def(
       "ds4_cuda_reference_scores",
       &ds4_cuda_reference_scores,

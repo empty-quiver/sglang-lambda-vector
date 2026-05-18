@@ -44,7 +44,19 @@ except ImportError:
     )
 
 
-OPTIMIZED_VARIANTS = ("v1", "v2", "v3", "v4", "v5", "v7", "v8", "v9", "v10", "v11")
+OPTIMIZED_VARIANTS = (
+    "v1",
+    "v2",
+    "v3",
+    "v4",
+    "v5",
+    "v7",
+    "v8",
+    "v9",
+    "v10",
+    "v11",
+    "v12",
+)
 
 
 def _env_paths(name: str) -> list[Path]:
