@@ -21,12 +21,17 @@ constexpr int kScaleCount = kNopeDim / kScaleGroup;
 constexpr int kScaleCacheOffset = kWarps;
 constexpr int kOptimizedV2SharedFloats = kWarps;
 constexpr int kOptimizedV3SharedFloats = kScaleCacheOffset + kScaleCount;
+constexpr int kV4WarpsPerHead = 2;
+constexpr int kV4HeadsPerBlock = kWarps / kV4WarpsPerHead;
+constexpr int kV4HeadThreads = kV4WarpsPerHead * 32;
+constexpr int kV4DimsPerThread = kHeadDim / kV4HeadThreads;
 
 enum class AttentionVariant : int {
   kReference = 0,
   kOptimizedV1 = 1,
   kOptimizedV2 = 2,
   kOptimizedV3 = 3,
+  kOptimizedV4 = 4,
 };
 
 __device__ __forceinline__ float fp8_e4m3fn_to_float(uint8_t bits) {
@@ -343,6 +348,84 @@ __device__ __forceinline__ void consume_sink_broadcast(
   }
   if (dim1 < kHeadDim) {
     acc1 *= old_scale;
+  }
+}
+
+__device__ __forceinline__ void stage_row_to_shared(
+    const uint8_t* packed,
+    float* kv_shared) {
+  const int tid = threadIdx.x;
+  const int dim0 = tid;
+  const int dim1 = tid + kThreads;
+  if (dim0 < kHeadDim) {
+    kv_shared[dim0] = load_dsv4_packed_dim(packed, dim0);
+  }
+  if (dim1 < kHeadDim) {
+    kv_shared[dim1] = load_dsv4_packed_dim(packed, dim1);
+  }
+  __syncthreads();
+}
+
+__device__ __forceinline__ float reduce_sum_head_group(
+    float value,
+    float* reduce_shared,
+    int head_slot,
+    int head_warp,
+    int lane) {
+  const int warp = threadIdx.x >> 5;
+  value = warp_reduce_sum(value);
+  if (lane == 0) {
+    reduce_shared[warp] = value;
+  }
+  __syncthreads();
+
+  const int first_warp = head_slot * kV4WarpsPerHead;
+  float total = 0.0f;
+  if (head_warp == 0) {
+    total = lane < kV4WarpsPerHead ? reduce_shared[first_warp + lane] : 0.0f;
+    total = warp_reduce_sum(total);
+    if (lane == 0) {
+      reduce_shared[first_warp] = total;
+    }
+  }
+  __syncthreads();
+  total = reduce_shared[first_warp];
+  __syncthreads();
+  return total;
+}
+
+__device__ __forceinline__ void consume_staged_row_warp_head(
+    const float* kv_shared,
+    float* reduce_shared,
+    float softmax_scale,
+    float& running_max,
+    float& running_sum,
+    float* acc,
+    const float* q_vals,
+    int head_slot,
+    int head_warp,
+    int head_thread,
+    int lane) {
+  float dot_part = 0.0f;
+#pragma unroll
+  for (int slot = 0; slot < kV4DimsPerThread; ++slot) {
+    const int dim = head_thread + slot * kV4HeadThreads;
+    const float value = kv_shared[dim];
+    dot_part += q_vals[slot] * value;
+  }
+
+  dot_part = reduce_sum_head_group(dot_part, reduce_shared, head_slot, head_warp, lane);
+  const float score = dot_part * softmax_scale;
+  const float new_max = fmaxf(running_max, score);
+  const float old_scale = running_sum == 0.0f ? 0.0f : expf(running_max - new_max);
+  const float row_scale = expf(score - new_max);
+  running_sum = running_sum * old_scale + row_scale;
+  running_max = new_max;
+
+#pragma unroll
+  for (int slot = 0; slot < kV4DimsPerThread; ++slot) {
+    const int dim = head_thread + slot * kV4HeadThreads;
+    acc[slot] = acc[slot] * old_scale + row_scale * kv_shared[dim];
   }
 }
 
@@ -733,6 +816,138 @@ __global__ void ds4_cuda_optimized_v2_attention_kernel(
   }
 }
 
+__global__ void ds4_cuda_grouped_head_attention_kernel(
+    const __nv_bfloat16* __restrict__ q,
+    const uint8_t* __restrict__ swa_cache,
+    const int32_t* __restrict__ swa_indices,
+    const int32_t* __restrict__ swa_lengths,
+    int swa_width,
+    int swa_page_size,
+    int swa_row_stride,
+    const float* __restrict__ attn_sink,
+    bool has_sink,
+    const uint8_t* __restrict__ extra_cache,
+    const int32_t* __restrict__ extra_indices,
+    const int32_t* __restrict__ extra_lengths,
+    int extra_width,
+    int extra_page_size,
+    int extra_row_stride,
+    bool has_extra,
+    float softmax_scale,
+    int batch_size,
+    int num_heads,
+    __nv_bfloat16* __restrict__ out) {
+  const int batch = blockIdx.x;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int head_slot = warp / kV4WarpsPerHead;
+  const int head_warp = warp - head_slot * kV4WarpsPerHead;
+  const int head_thread = head_warp * 32 + lane;
+  if (batch >= batch_size) {
+    return;
+  }
+  const int head = blockIdx.y * kV4HeadsPerBlock + head_slot;
+  const bool active_head = head < num_heads;
+
+  __shared__ float kv_shared[kHeadDim];
+  __shared__ float reduce_shared[kWarps];
+
+  const int64_t q_base = (static_cast<int64_t>(batch) * num_heads + head) * kHeadDim;
+  float q_vals[kV4DimsPerThread];
+  float acc[kV4DimsPerThread];
+#pragma unroll
+  for (int slot = 0; slot < kV4DimsPerThread; ++slot) {
+    const int dim = head_thread + slot * kV4HeadThreads;
+    q_vals[slot] = active_head ? __bfloat162float(q[q_base + dim]) : 0.0f;
+    acc[slot] = 0.0f;
+  }
+
+  float running_max = -INFINITY;
+  float running_sum = 0.0f;
+
+  int swa_len = swa_lengths[batch];
+  if (swa_len < 0) {
+    swa_len = 0;
+  }
+  if (swa_len > swa_width) {
+    swa_len = swa_width;
+  }
+  for (int row = 0; row < swa_len; ++row) {
+    const uint8_t* packed = selected_row_ptr(
+        swa_cache, swa_indices, swa_width, swa_page_size, swa_row_stride, batch, row);
+    stage_row_to_shared(packed, kv_shared);
+    consume_staged_row_warp_head(
+        kv_shared,
+        reduce_shared,
+        softmax_scale,
+        running_max,
+        running_sum,
+        acc,
+        q_vals,
+        head_slot,
+        head_warp,
+        head_thread,
+        lane);
+    __syncthreads();
+  }
+
+  if (has_extra) {
+    int extra_len = extra_lengths[batch];
+    if (extra_len < 0) {
+      extra_len = 0;
+    }
+    if (extra_len > extra_width) {
+      extra_len = extra_width;
+    }
+    for (int row = 0; row < extra_len; ++row) {
+      const uint8_t* packed = selected_row_ptr(
+          extra_cache,
+          extra_indices,
+          extra_width,
+          extra_page_size,
+          extra_row_stride,
+          batch,
+          row);
+      stage_row_to_shared(packed, kv_shared);
+      consume_staged_row_warp_head(
+          kv_shared,
+          reduce_shared,
+          softmax_scale,
+          running_max,
+          running_sum,
+          acc,
+          q_vals,
+          head_slot,
+          head_warp,
+          head_thread,
+          lane);
+      __syncthreads();
+    }
+  }
+
+  if (active_head && has_sink) {
+    const float sink = attn_sink[head];
+    const float new_max = fmaxf(running_max, sink);
+    const float old_scale = running_sum == 0.0f ? 0.0f : expf(running_max - new_max);
+    const float sink_scale = expf(sink - new_max);
+    running_sum = running_sum * old_scale + sink_scale;
+    running_max = new_max;
+#pragma unroll
+    for (int slot = 0; slot < kV4DimsPerThread; ++slot) {
+      acc[slot] *= old_scale;
+    }
+  }
+
+  const float inv_sum = running_sum > 0.0f ? 1.0f / running_sum : 0.0f;
+#pragma unroll
+  for (int slot = 0; slot < kV4DimsPerThread; ++slot) {
+    const int dim = head_thread + slot * kV4HeadThreads;
+    if (active_head) {
+      out[q_base + dim] = __float2bfloat16(acc[slot] * inv_sum);
+    }
+  }
+}
+
 int64_t flattened_batch(torch::Tensor q) {
   TORCH_CHECK(q.dim() >= 3, "q must have shape [..., heads, 512], got ", q.sizes());
   TORCH_CHECK(q.size(-1) == kHeadDim, "q head dim must be 512, got ", q.size(-1));
@@ -813,6 +1028,9 @@ torch::Tensor launch_ds4_cuda_attention(
   auto out = torch::empty_like(q);
 
   dim3 grid(batch_size, num_heads);
+  dim3 grouped_grid(
+      static_cast<unsigned int>(batch_size),
+      static_cast<unsigned int>((num_heads + kV4HeadsPerBlock - 1) / kV4HeadsPerBlock));
   dim3 block(kThreads);
   switch (variant) {
     case AttentionVariant::kReference:
@@ -888,6 +1106,30 @@ torch::Tensor launch_ds4_cuda_attention(
     case AttentionVariant::kOptimizedV3:
       ds4_cuda_optimized_v2_attention_kernel<true>
           <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+              reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
+              swa_k_cache.data_ptr<uint8_t>(),
+              swa_indices.data_ptr<int32_t>(),
+              swa_topk_lengths.data_ptr<int32_t>(),
+              static_cast<int>(swa_width),
+              static_cast<int>(swa_page_size),
+              static_cast<int>(swa_k_cache.size(3)),
+              has_sink ? attn_sink.data_ptr<float>() : nullptr,
+              has_sink,
+              has_extra ? extra_k_cache.data_ptr<uint8_t>() : nullptr,
+              has_extra ? extra_indices.data_ptr<int32_t>() : nullptr,
+              has_extra ? extra_topk_lengths.data_ptr<int32_t>() : nullptr,
+              static_cast<int>(extra_width),
+              static_cast<int>(extra_page_size),
+              has_extra ? static_cast<int>(extra_k_cache.size(3)) : 0,
+              has_extra,
+              static_cast<float>(softmax_scale),
+              static_cast<int>(batch_size),
+              static_cast<int>(num_heads),
+              reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
+      break;
+    case AttentionVariant::kOptimizedV4:
+      ds4_cuda_grouped_head_attention_kernel
+          <<<grouped_grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
               reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
               swa_k_cache.data_ptr<uint8_t>(),
               swa_indices.data_ptr<int32_t>(),
@@ -1022,4 +1264,31 @@ torch::Tensor ds4_cuda_optimized_v3_attention(
       extra_topk_lengths,
       extra_page_size,
       AttentionVariant::kOptimizedV3);
+}
+
+torch::Tensor ds4_cuda_optimized_v4_attention(
+    torch::Tensor q,
+    torch::Tensor swa_k_cache,
+    torch::Tensor swa_indices,
+    torch::Tensor swa_topk_lengths,
+    int64_t swa_page_size,
+    double softmax_scale,
+    torch::Tensor attn_sink,
+    torch::Tensor extra_k_cache,
+    torch::Tensor extra_indices,
+    torch::Tensor extra_topk_lengths,
+    int64_t extra_page_size) {
+  return launch_ds4_cuda_attention(
+      q,
+      swa_k_cache,
+      swa_indices,
+      swa_topk_lengths,
+      swa_page_size,
+      softmax_scale,
+      attn_sink,
+      extra_k_cache,
+      extra_indices,
+      extra_topk_lengths,
+      extra_page_size,
+      AttentionVariant::kOptimizedV4);
 }
