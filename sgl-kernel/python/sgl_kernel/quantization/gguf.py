@@ -58,5 +58,21 @@ def ggml_moe_a8_vec(
     )
 
 
+def ggml_moe_a8_vec_weighted_accum(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    expert_ids: torch.Tensor,
+    token_ids: torch.Tensor,
+    weights: torch.Tensor,
+    type: int,
+    row: int,
+    tokens: int,
+    output_tokens: int,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.ggml_moe_a8_vec_weighted_accum.default(
+        input, weight, expert_ids, token_ids, weights, type, row, tokens, output_tokens
+    )
+
+
 def ggml_moe_get_block_size(type: int) -> int:
     return torch.ops.sgl_kernel.ggml_moe_get_block_size.default(type)

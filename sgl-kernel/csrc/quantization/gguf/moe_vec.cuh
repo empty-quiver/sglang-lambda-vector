@@ -2,6 +2,8 @@
 // https://github.com/vllm-project/vllm/blob/4492e3a55428e161ca8db381edc28263e5da4c8d/csrc/quantization/gguf/moe_vec.cuh
 // copied and adapted from
 // https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/mmvq.cu
+#include <ATen/cuda/Atomic.cuh>
+
 template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
 static __global__ void moe_vec_q(
     const void* __restrict__ vx,
@@ -55,6 +57,72 @@ static __global__ void moe_vec_q(
   if (threadIdx.x == 0) {
     dst[blockIdx.z * nrows + row] = tmp;
   }
+}
+
+template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
+static __global__ void moe_vec_q_weighted_accum(
+    const void* __restrict__ vx,
+    const void* __restrict__ vy,
+    scalar_t* __restrict__ dst,
+    const int* expert_ids,
+    const int64_t* token_ids,
+    const float* weights,
+    const int ncols,
+    const int nrows,
+    const int token_stride) {
+  const auto row = blockIdx.x * blockDim.y + threadIdx.y;
+  const auto active_idx = blockIdx.z;
+  const auto expert = expert_ids[active_idx];
+  const auto token = token_ids[active_idx];
+
+  if (row >= nrows || expert < 0) {
+    return;
+  }
+
+  const int blocks_per_row = ncols / qk;
+  const int blocks_per_warp = vdr * WARP_SIZE / qi;
+
+  float tmp = 0.0f;
+
+  const block_q_t* x = ((const block_q_t*)vx) + expert * nrows * blocks_per_row;
+  const block_q8_1* y = (const block_q8_1*)(((const int*)vy) + active_idx * token_stride);
+
+  for (auto i = threadIdx.x / (qi / vdr); i < blocks_per_row; i += blocks_per_warp) {
+    const int ibx = row * blocks_per_row + i;
+    const int iby = i * (qk / QK8_1);
+    const int iqs = vdr * (threadIdx.x % (qi / vdr));
+
+    tmp += vec_dot_q_cuda(&x[ibx], &y[iby], iqs);
+  }
+
+#pragma unroll
+  for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+    tmp += SGLANG_SHFL_XOR_SYNC(uint32_t(-1), tmp, mask);
+  }
+
+  if (threadIdx.x == 0) {
+    gpuAtomicAdd(&dst[token * nrows + row], static_cast<scalar_t>(tmp * weights[active_idx]));
+  }
+}
+
+template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
+static void moe_vec_q_weighted_accum_cuda(
+    const void* vx,
+    const void* vy,
+    scalar_t* dst,
+    const int* expert_ids,
+    const int64_t* token_ids,
+    const float* weights,
+    const int active_tokens,
+    const int ncols,
+    const int nrows,
+    const int token_stride,
+    cudaStream_t stream) {
+  const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
+  const dim3 block_nums(block_num_y, 1, active_tokens);
+  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
+  moe_vec_q_weighted_accum<scalar_t, qk, qi, block_q_t, vdr, vec_dot_q_cuda>
+      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, expert_ids, token_ids, weights, ncols, nrows, token_stride);
 }
 
 template <typename scalar_t>

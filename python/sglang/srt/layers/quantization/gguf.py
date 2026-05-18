@@ -46,6 +46,7 @@ if _is_cuda:
         ggml_dequantize,
         ggml_moe_a8,
         ggml_moe_a8_vec,
+        ggml_moe_a8_vec_weighted_accum,
         ggml_moe_get_block_size,
         ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
@@ -61,6 +62,7 @@ elif _is_musa:
         ggml_dequantize,
         ggml_moe_a8,
         ggml_moe_a8_vec,
+        ggml_moe_a8_vec_weighted_accum,
         ggml_moe_get_block_size,
         ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
@@ -395,6 +397,15 @@ def _gguf_moe_masked_vec_enabled(qweight_type: int, qweight_type2: int) -> bool:
     )
 
 
+def _gguf_moe_weighted_accum_enabled(qweight_type: int, qweight_type2: int) -> bool:
+    return (
+        _gguf_env_enabled("SGLANG_GGUF_MOE_WEIGHTED_ACCUM")
+        and qweight_type in MMVQ_QUANT_TYPES
+        and _gguf_quant_type_to_int(qweight_type2)
+        in (int(WeightType.Q2_K), int(WeightType.IQ4_XS))
+    )
+
+
 def fused_moe_gguf(
     x: torch.Tensor,
     w1: torch.Tensor,
@@ -461,6 +472,35 @@ def fused_moe_gguf(
         active_token_ids = token_ids[active_mask].contiguous()
         active_weights = topk_weights[active_mask].view(active_tokens, 1)
         active_x = x.index_select(0, active_token_ids)
+
+        if _gguf_moe_weighted_accum_enabled(qweight_type, qweight_type2):
+            active_topk_ids_i32 = active_topk_ids.to(torch.int32)
+            active_out = ggml_moe_a8_vec(
+                active_x,
+                w1,
+                active_topk_ids_i32,
+                1,
+                qweight_type,
+                w1.shape[1],
+                active_tokens,
+            )
+            active_out = act(active_out)
+            out_hidden_states = ggml_moe_a8_vec_weighted_accum(
+                active_out,
+                w2,
+                active_topk_ids_i32.view(-1),
+                active_token_ids,
+                active_weights.view(-1).to(torch.float32),
+                qweight_type2,
+                w2.shape[1],
+                active_tokens,
+                num_tokens,
+            )
+            trace_done(
+                "active_filter_weighted_accum",
+                f"active_tokens={active_tokens} original_tokens={num_tokens}",
+            )
+            return out_hidden_states
 
         active_out = fused_moe_gguf(
             x=active_x,

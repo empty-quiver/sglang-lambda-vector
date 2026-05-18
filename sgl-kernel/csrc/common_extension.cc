@@ -449,6 +449,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int type, SymInt row, SymInt tokens) -> Tensor");
   m.impl("ggml_moe_a8_vec", torch::kCUDA, &ggml_moe_a8_vec);
 
+  m.def(
+      "ggml_moe_a8_vec_weighted_accum(Tensor X, Tensor W, "
+      "Tensor expert_ids, Tensor token_ids, Tensor weights, "
+      "int type, SymInt row, SymInt tokens, SymInt output_tokens) -> Tensor");
+  m.impl("ggml_moe_a8_vec_weighted_accum", torch::kCUDA, &ggml_moe_a8_vec_weighted_accum);
+
   m.def("ggml_moe_get_block_size(int type) -> int");
   m.impl("ggml_moe_get_block_size", torch::kCUDA, &ggml_moe_get_block_size);
 

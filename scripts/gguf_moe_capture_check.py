@@ -120,6 +120,7 @@ def _check_masked_kernel(
     repo_python = Path(__file__).resolve().parents[1] / "python"
     sys.path.insert(0, str(repo_python))
 
+    os.environ.pop("SGLANG_GGUF_MOE_WEIGHTED_ACCUM", None)
     os.environ["SGLANG_GGUF_MOE_MASKED_VEC"] = "1"
     from sglang.srt.layers.quantization.gguf import fused_moe_gguf
 
@@ -150,6 +151,51 @@ def _check_masked_kernel(
     return out
 
 
+def _check_weighted_accum_kernel(
+    capture: dict, device: str, *, atol: float, rtol: float
+) -> torch.Tensor | None:
+    missing = [key for key in ("w1", "w2") if key not in capture]
+    if missing:
+        print(
+            "weighted_accum_kernel: skipped; capture does not include "
+            f"{', '.join(missing)}. Set SGLANG_GGUF_MOE_CAPTURE_WEIGHTS=1.",
+        )
+        return None
+
+    repo_python = Path(__file__).resolve().parents[1] / "python"
+    sys.path.insert(0, str(repo_python))
+
+    os.environ.pop("SGLANG_GGUF_MOE_MASKED_VEC", None)
+    os.environ["SGLANG_GGUF_MOE_WEIGHTED_ACCUM"] = "1"
+    from sglang.srt.layers.quantization.gguf import fused_moe_gguf
+
+    x = capture["x"].to(device)
+    topk_weights = capture["topk_weights"].to(device)
+    topk_ids = capture["topk_ids"].to(device)
+    w1 = capture["w1"].to(device)
+    w2 = capture["w2"].to(device)
+
+    out = fused_moe_gguf(
+        x=x,
+        w1=w1,
+        w2=w2,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        qweight_type=int(capture["qweight_type"]),
+        qweight_type2=int(capture["qweight_type2"]),
+        activation=capture["activation"],
+        debug_layer=capture.get("debug_layer"),
+    ).cpu()
+    _assert_close(
+        "weighted_accum_kernel_full_out",
+        out,
+        capture["out_hidden_states"],
+        atol=atol,
+        rtol=rtol,
+    )
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("capture", type=Path)
@@ -167,6 +213,11 @@ def main() -> int:
         "--skip-masked-kernel",
         action="store_true",
         help="Skip rerunning the masked full-token kernel path.",
+    )
+    parser.add_argument(
+        "--skip-weighted-accum-kernel",
+        action="store_true",
+        help="Skip rerunning the compact weighted-accumulation kernel path.",
     )
     parser.add_argument(
         "--atol",
@@ -195,6 +246,7 @@ def main() -> int:
     _check_active_reconstruction(capture, atol=args.atol, rtol=args.rtol)
     current_out = None
     masked_out = None
+    weighted_accum_out = None
     if not args.skip_current_kernel:
         if args.device == "cpu":
             print("current_kernel: skipped; GGUF CUDA kernel requires CUDA")
@@ -209,11 +261,27 @@ def main() -> int:
             masked_out = _check_masked_kernel(
                 capture, args.device, atol=args.atol, rtol=args.rtol
             )
+    if not args.skip_weighted_accum_kernel:
+        if args.device == "cpu":
+            print("weighted_accum_kernel: skipped; GGUF CUDA kernel requires CUDA")
+        else:
+            weighted_accum_out = _check_weighted_accum_kernel(
+                capture, args.device, atol=args.atol, rtol=args.rtol
+            )
     if current_out is not None and masked_out is not None:
         current_full = _reconstruct_from_active(capture, current_out)
         _assert_close(
             "masked_vs_current_active_replay",
             masked_out,
+            current_full,
+            atol=args.atol,
+            rtol=args.rtol,
+        )
+    if current_out is not None and weighted_accum_out is not None:
+        current_full = _reconstruct_from_active(capture, current_out)
+        _assert_close(
+            "weighted_accum_vs_current_active_replay",
+            weighted_accum_out,
             current_full,
             atol=args.atol,
             rtol=args.rtol,

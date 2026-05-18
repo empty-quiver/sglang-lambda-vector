@@ -848,6 +848,71 @@ torch::Tensor ggml_moe_a8_vec(
   return Y;
 }
 
+torch::Tensor ggml_moe_a8_vec_weighted_accum(
+    torch::Tensor X,  // active input rows
+    torch::Tensor W,  // expert weights
+    torch::Tensor expert_ids,
+    torch::Tensor token_ids,
+    torch::Tensor weights,
+    int64_t type,
+    int64_t row,
+    int64_t tokens,
+    int64_t output_tokens) {
+  TORCH_CHECK(expert_ids.scalar_type() == torch::kInt32, "expert_ids must be int32");
+  TORCH_CHECK(token_ids.scalar_type() == torch::kInt64, "token_ids must be int64");
+  TORCH_CHECK(weights.scalar_type() == torch::kFloat32, "weights must be float32");
+  TORCH_CHECK(X.sizes()[0] == tokens, "X rows must match tokens");
+  TORCH_CHECK(expert_ids.numel() >= tokens, "expert_ids must cover tokens");
+  TORCH_CHECK(token_ids.numel() >= tokens, "token_ids must cover tokens");
+  TORCH_CHECK(weights.numel() >= tokens, "weights must cover tokens");
+
+  int col = X.sizes()[1];
+  const int padded = (col + 512 - 1) / 512 * 512;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
+  auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
+  at::Tensor Y = torch::zeros({output_tokens, row}, options);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
+  at::Tensor quant_X = torch::empty({tokens, padded / 32 * 9}, options);
+  DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_moe_vec_weighted_accum_a8", [&] {
+    quantize_row_q8_1_cuda<scalar_t>((scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, tokens, stream);
+    switch (type) {
+      case 10:
+        moe_vec_q_weighted_accum_cuda<scalar_t, QK_K, QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1>(
+            (void*)W.data_ptr(),
+            (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            (int*)expert_ids.data_ptr(),
+            (int64_t*)token_ids.data_ptr(),
+            (float*)weights.data_ptr(),
+            tokens,
+            col,
+            row,
+            quant_X.stride(0),
+            stream);
+        break;
+      case 23:
+        moe_vec_q_weighted_accum_cuda<scalar_t, QK_K, QI4_XS, block_iq4_xs, 1, vec_dot_iq4_xs_q8_1>(
+            (void*)W.data_ptr(),
+            (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            (int*)expert_ids.data_ptr(),
+            (int64_t*)token_ids.data_ptr(),
+            (float*)weights.data_ptr(),
+            tokens,
+            col,
+            row,
+            quant_X.stride(0),
+            stream);
+        break;
+      default:
+        TORCH_CHECK(false, "unsupported GGUF MoE weighted-accum vec quant type: ", type);
+    }
+    gguf_check_cuda_launch("ggml_moe_a8_vec_weighted_accum qtype kernel", stream);
+  });
+  return Y;
+}
+
 int64_t ggml_moe_get_block_size(int64_t type) {
   switch (type) {
     case 2:

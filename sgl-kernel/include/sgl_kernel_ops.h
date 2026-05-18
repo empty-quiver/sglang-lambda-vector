@@ -723,6 +723,17 @@ torch::Tensor ggml_moe_a8(
 torch::Tensor ggml_moe_a8_vec(
     torch::Tensor X, torch::Tensor W, torch::Tensor topk_ids, int64_t top_k, int64_t type, int64_t row, int64_t tokens);
 
+torch::Tensor ggml_moe_a8_vec_weighted_accum(
+    torch::Tensor X,
+    torch::Tensor W,
+    torch::Tensor expert_ids,
+    torch::Tensor token_ids,
+    torch::Tensor weights,
+    int64_t type,
+    int64_t row,
+    int64_t tokens,
+    int64_t output_tokens);
+
 int64_t ggml_moe_get_block_size(int64_t type);
 
 /*
