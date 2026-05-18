@@ -62,6 +62,7 @@ OPTIMIZED_VARIANTS = (
     "v16",
     "v17",
     "v18",
+    "v19",
 )
 
 

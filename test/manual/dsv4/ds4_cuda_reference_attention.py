@@ -77,6 +77,8 @@ def _resolve_op(ext, optimized: bool | str | int):
         return ext.ds4_cuda_optimized_v17_attention
     if optimized == 18 or optimized in {"v18", "reduce_scale_reuse_tensor_core_pv"}:
         return ext.ds4_cuda_optimized_v18_attention
+    if optimized == 19 or optimized in {"v19", "score_state_split_tensor_core_pv"}:
+        return ext.ds4_cuda_optimized_v19_attention
     raise ValueError(f"unknown DS4 CUDA attention variant: {optimized!r}")
 
 
