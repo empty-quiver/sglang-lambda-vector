@@ -53,6 +53,7 @@ constexpr int kV15DimOuterRounds = kV11DimRounds / kV15DimRoundGroups;
 static_assert(
     kV11DimRounds % kV15DimRoundGroups == 0,
     "v15 expects dimension rounds to divide evenly into round groups");
+constexpr int kReduceScaleCacheMaxRowTiles = 16;
 constexpr int kPartialProfileRowSetup = 0;
 constexpr int kPartialProfileScaleCache = 1;
 constexpr int kPartialProfileQk = 2;
@@ -87,6 +88,7 @@ enum class AttentionVariant : int {
   kOptimizedV15 = 15,
   kOptimizedV16 = 16,
   kOptimizedV17 = 17,
+  kOptimizedV18 = 18,
 };
 
 const char* attention_variant_name(AttentionVariant variant) {
@@ -125,6 +127,8 @@ const char* attention_variant_name(AttentionVariant variant) {
       return "v16";
     case AttentionVariant::kOptimizedV17:
       return "v17";
+    case AttentionVariant::kOptimizedV18:
+      return "v18";
   }
   return "unknown";
 }
@@ -2400,7 +2404,7 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
   }
 }
 
-template <typename PartialAccT = float>
+template <typename PartialAccT = float, bool CacheReduceScales = false>
 __global__ void ds4_cuda_fused_v8_reduce_kernel(
     const float* __restrict__ partial_max,
     const float* __restrict__ partial_sum,
@@ -2422,6 +2426,10 @@ __global__ void ds4_cuda_fused_v8_reduce_kernel(
   __shared__ float final_max[kScoreTileM];
   __shared__ float final_sum[kScoreTileM];
   __shared__ float inv_sum[kScoreTileM];
+  __shared__ float reduce_scale_shared
+      [kScoreTileM][CacheReduceScales ? kReduceScaleCacheMaxRowTiles : 1];
+  const bool cache_reduce_scales =
+      CacheReduceScales && row_tiles <= kReduceScaleCacheMaxRowTiles;
 
   if (threadIdx.x < kScoreTileM) {
     const int head_slot = threadIdx.x;
@@ -2452,11 +2460,27 @@ __global__ void ds4_cuda_fused_v8_reduce_kernel(
              head_slot);
         const float l = partial_sum[state_offset];
         if (l > 0.0f) {
-          l_total += l * expf(partial_max[state_offset] - m);
+          const float scale = expf(partial_max[state_offset] - m);
+          l_total += l * scale;
+          if constexpr (CacheReduceScales) {
+            if (cache_reduce_scales) {
+              reduce_scale_shared[head_slot][row_tile] = scale;
+            }
+          }
+        } else if constexpr (CacheReduceScales) {
+          if (cache_reduce_scales) {
+            reduce_scale_shared[head_slot][row_tile] = 0.0f;
+          }
         }
       }
       if (has_sink) {
         l_total += expf(attn_sink[head] - m);
+      }
+    } else if constexpr (CacheReduceScales) {
+      if (cache_reduce_scales) {
+        for (int row_tile = 0; row_tile < row_tiles; ++row_tile) {
+          reduce_scale_shared[head_slot][row_tile] = 0.0f;
+        }
       }
     }
 
@@ -2477,9 +2501,21 @@ __global__ void ds4_cuda_fused_v8_reduce_kernel(
             (((static_cast<int64_t>(batch) * head_tiles + head_tile) * row_tiles + row_tile) *
                  kScoreTileM +
              head_slot);
-        const float l = partial_sum[state_offset];
-        if (l > 0.0f) {
-          const float scale = expf(partial_max[state_offset] - final_max[head_slot]);
+        float scale = 0.0f;
+        if constexpr (CacheReduceScales) {
+          if (cache_reduce_scales) {
+            scale = reduce_scale_shared[head_slot][row_tile];
+          } else {
+            const float l = partial_sum[state_offset];
+            scale =
+                l > 0.0f ? expf(partial_max[state_offset] - final_max[head_slot]) : 0.0f;
+          }
+        } else {
+          const float l = partial_sum[state_offset];
+          scale =
+              l > 0.0f ? expf(partial_max[state_offset] - final_max[head_slot]) : 0.0f;
+        }
+        if (scale != 0.0f) {
           const int64_t acc_offset =
               ((((static_cast<int64_t>(batch) * head_tiles + head_tile) * row_tiles + row_tile) *
                     kScoreTileM +
@@ -2765,7 +2801,8 @@ torch::Tensor launch_ds4_cuda_attention(
     case AttentionVariant::kOptimizedV14:
     case AttentionVariant::kOptimizedV15:
     case AttentionVariant::kOptimizedV16:
-    case AttentionVariant::kOptimizedV17: {
+    case AttentionVariant::kOptimizedV17:
+    case AttentionVariant::kOptimizedV18: {
       const bool cache_scales = variant != AttentionVariant::kOptimizedV8;
       const bool tensor_core_pv = variant == AttentionVariant::kOptimizedV10;
       const bool tensor_core_pv_parallel = variant == AttentionVariant::kOptimizedV11;
@@ -2777,11 +2814,15 @@ torch::Tensor launch_ds4_cuda_attention(
       const bool tensor_core_pv_rowgroup_accum =
           variant == AttentionVariant::kOptimizedV15 ||
           variant == AttentionVariant::kOptimizedV16 ||
-          variant == AttentionVariant::kOptimizedV17;
+          variant == AttentionVariant::kOptimizedV17 ||
+          variant == AttentionVariant::kOptimizedV18;
       const bool tensor_core_pv_coalesced_k_staging =
           variant == AttentionVariant::kOptimizedV16;
       const bool tensor_core_pv_q_tile_reuse =
-          variant == AttentionVariant::kOptimizedV17;
+          variant == AttentionVariant::kOptimizedV17 ||
+          variant == AttentionVariant::kOptimizedV18;
+      const bool tensor_core_pv_reduce_scale_reuse =
+          variant == AttentionVariant::kOptimizedV18;
       const int64_t head_tiles = (num_heads + kScoreTileM - 1) / kScoreTileM;
       const int64_t row_tiles = (total_width + kScoreRowsPerBlock - 1) / kScoreRowsPerBlock;
       auto partial_max = torch::empty(
@@ -3192,18 +3233,33 @@ torch::Tensor launch_ds4_cuda_attention(
       if (tensor_core_pv_cached_bf16_partial ||
           tensor_core_pv_specialized_v_decode ||
           tensor_core_pv_rowgroup_accum) {
-        ds4_cuda_fused_v8_reduce_kernel<__nv_bfloat16>
-            <<<fused_grid, split_block, 0, stream>>>(
-                partial_max.data_ptr<float>(),
-                partial_sum.data_ptr<float>(),
-                reinterpret_cast<const __nv_bfloat16*>(partial_acc.data_ptr<at::BFloat16>()),
-                has_sink ? attn_sink.data_ptr<float>() : nullptr,
-                has_sink,
-                static_cast<int>(batch_size),
-                static_cast<int>(num_heads),
-                static_cast<int>(head_tiles),
-                static_cast<int>(row_tiles),
-                reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
+        if (tensor_core_pv_reduce_scale_reuse) {
+          ds4_cuda_fused_v8_reduce_kernel<__nv_bfloat16, true>
+              <<<fused_grid, split_block, 0, stream>>>(
+                  partial_max.data_ptr<float>(),
+                  partial_sum.data_ptr<float>(),
+                  reinterpret_cast<const __nv_bfloat16*>(partial_acc.data_ptr<at::BFloat16>()),
+                  has_sink ? attn_sink.data_ptr<float>() : nullptr,
+                  has_sink,
+                  static_cast<int>(batch_size),
+                  static_cast<int>(num_heads),
+                  static_cast<int>(head_tiles),
+                  static_cast<int>(row_tiles),
+                  reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
+        } else {
+          ds4_cuda_fused_v8_reduce_kernel<__nv_bfloat16>
+              <<<fused_grid, split_block, 0, stream>>>(
+                  partial_max.data_ptr<float>(),
+                  partial_sum.data_ptr<float>(),
+                  reinterpret_cast<const __nv_bfloat16*>(partial_acc.data_ptr<at::BFloat16>()),
+                  has_sink ? attn_sink.data_ptr<float>() : nullptr,
+                  has_sink,
+                  static_cast<int>(batch_size),
+                  static_cast<int>(num_heads),
+                  static_cast<int>(head_tiles),
+                  static_cast<int>(row_tiles),
+                  reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
+        }
       } else {
         ds4_cuda_fused_v8_reduce_kernel<float>
             <<<fused_grid, split_block, 0, stream>>>(
@@ -3901,6 +3957,33 @@ torch::Tensor ds4_cuda_optimized_v17_attention(
       extra_topk_lengths,
       extra_page_size,
       AttentionVariant::kOptimizedV17);
+}
+
+torch::Tensor ds4_cuda_optimized_v18_attention(
+    torch::Tensor q,
+    torch::Tensor swa_k_cache,
+    torch::Tensor swa_indices,
+    torch::Tensor swa_topk_lengths,
+    int64_t swa_page_size,
+    double softmax_scale,
+    torch::Tensor attn_sink,
+    torch::Tensor extra_k_cache,
+    torch::Tensor extra_indices,
+    torch::Tensor extra_topk_lengths,
+    int64_t extra_page_size) {
+  return launch_ds4_cuda_attention(
+      q,
+      swa_k_cache,
+      swa_indices,
+      swa_topk_lengths,
+      swa_page_size,
+      softmax_scale,
+      attn_sink,
+      extra_k_cache,
+      extra_indices,
+      extra_topk_lengths,
+      extra_page_size,
+      AttentionVariant::kOptimizedV18);
 }
 
 torch::Tensor ds4_cuda_reference_scores(
