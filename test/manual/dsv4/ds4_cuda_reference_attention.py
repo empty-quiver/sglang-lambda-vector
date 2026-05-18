@@ -81,6 +81,8 @@ def _resolve_op(ext, optimized: bool | str | int):
         return ext.ds4_cuda_optimized_v19_attention
     if optimized == 20 or optimized in {"v20", "parallel_score_state_finalize"}:
         return ext.ds4_cuda_optimized_v20_attention
+    if optimized == 21 or optimized in {"v21", "compact_score_metadata"}:
+        return ext.ds4_cuda_optimized_v21_attention
     raise ValueError(f"unknown DS4 CUDA attention variant: {optimized!r}")
 
 

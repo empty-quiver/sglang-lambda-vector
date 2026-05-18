@@ -91,6 +91,7 @@ enum class AttentionVariant : int {
   kOptimizedV18 = 18,
   kOptimizedV19 = 19,
   kOptimizedV20 = 20,
+  kOptimizedV21 = 21,
 };
 
 const char* attention_variant_name(AttentionVariant variant) {
@@ -135,6 +136,8 @@ const char* attention_variant_name(AttentionVariant variant) {
       return "v19";
     case AttentionVariant::kOptimizedV20:
       return "v20";
+    case AttentionVariant::kOptimizedV21:
+      return "v21";
   }
   return "unknown";
 }
@@ -2561,7 +2564,10 @@ __global__ void ds4_cuda_fused_v19_score_kernel(
     int row_tiles,
     float* __restrict__ partial_max,
     float* __restrict__ partial_sum,
-    float* __restrict__ score_state) {
+    float* __restrict__ score_state,
+    int64_t* __restrict__ row_ptr_state,
+    uint8_t* __restrict__ row_scale_byte_state,
+    uint8_t* __restrict__ row_valid_state) {
   namespace wmma = nvcuda::wmma;
 
   const int batch = blockIdx.x;
@@ -2607,17 +2613,30 @@ __global__ void ds4_cuda_fused_v19_score_kernel(
     }
     row_ptrs[threadIdx.x] = packed;
     row_valid[threadIdx.x] = valid ? 1 : 0;
+    if (row_ptr_state != nullptr && head_tile == 0 && row < total_width) {
+      const int64_t meta_offset = static_cast<int64_t>(batch) * total_width + row;
+      row_ptr_state[meta_offset] =
+          valid ? static_cast<int64_t>(reinterpret_cast<uintptr_t>(packed)) : 0;
+      row_valid_state[meta_offset] = valid ? 1 : 0;
+    }
   }
   __syncthreads();
 
   if (threadIdx.x < kScoreRowsPerBlock * kScaleCount) {
     const int row_slot = threadIdx.x / kScaleCount;
     const int scale_slot = threadIdx.x - row_slot * kScaleCount;
+    const int row = tile_row_base + row_slot;
     const uint8_t* packed = row_ptrs[row_slot];
     row_scales[row_slot][scale_slot] =
         row_valid[row_slot]
             ? exp2f(static_cast<float>(packed[kScaleOffset + scale_slot]) - 127.0f)
             : 0.0f;
+    if (row_scale_byte_state != nullptr && head_tile == 0 && row < total_width) {
+      const int64_t meta_offset =
+          (static_cast<int64_t>(batch) * total_width + row) * kScaleCount + scale_slot;
+      row_scale_byte_state[meta_offset] =
+          row_valid[row_slot] ? packed[kScaleOffset + scale_slot] : 0;
+    }
   }
   __syncthreads();
 
@@ -2971,6 +2990,9 @@ __global__ void ds4_cuda_fused_v20_finalize_kernel(
     int total_width,
     int head_tiles,
     int row_tiles,
+    const int64_t* __restrict__ row_ptr_state,
+    const uint8_t* __restrict__ row_scale_byte_state,
+    const uint8_t* __restrict__ row_valid_state,
     __nv_bfloat16* __restrict__ out) {
   namespace wmma = nvcuda::wmma;
 
@@ -3057,7 +3079,14 @@ __global__ void ds4_cuda_fused_v20_finalize_kernel(
         const int row = row_tile * kScoreRowsPerBlock + threadIdx.x;
         bool valid = false;
         const uint8_t* packed = nullptr;
-        if (row < total_width) {
+        if (row < total_width && row_ptr_state != nullptr) {
+          const int64_t meta_offset = static_cast<int64_t>(batch) * total_width + row;
+          valid = row_valid_state[meta_offset] != 0;
+          packed = valid
+              ? reinterpret_cast<const uint8_t*>(
+                    static_cast<uintptr_t>(row_ptr_state[meta_offset]))
+              : nullptr;
+        } else if (row < total_width) {
           packed = selected_combined_row_ptr(
               swa_cache,
               swa_indices,
@@ -3083,11 +3112,22 @@ __global__ void ds4_cuda_fused_v20_finalize_kernel(
       if (threadIdx.x < kScoreRowsPerBlock * kScaleCount) {
         const int row_slot = threadIdx.x / kScaleCount;
         const int local_scale_slot = threadIdx.x - row_slot * kScaleCount;
+        const int row = row_tile * kScoreRowsPerBlock + row_slot;
         const uint8_t* packed = row_ptrs[row_slot];
-        row_scales[row_slot][local_scale_slot] =
-            row_valid[row_slot]
-                ? exp2f(static_cast<float>(packed[kScaleOffset + local_scale_slot]) - 127.0f)
-                : 0.0f;
+        if (row_scale_byte_state != nullptr && row < total_width) {
+          const int64_t meta_offset =
+              (static_cast<int64_t>(batch) * total_width + row) * kScaleCount +
+              local_scale_slot;
+          row_scales[row_slot][local_scale_slot] =
+              row_valid[row_slot]
+                  ? exp2f(static_cast<float>(row_scale_byte_state[meta_offset]) - 127.0f)
+                  : 0.0f;
+        } else {
+          row_scales[row_slot][local_scale_slot] =
+              row_valid[row_slot]
+                  ? exp2f(static_cast<float>(packed[kScaleOffset + local_scale_slot]) - 127.0f)
+                  : 0.0f;
+        }
       }
       __syncthreads();
 
@@ -4007,7 +4047,8 @@ torch::Tensor launch_ds4_cuda_attention(
       break;
     }
     case AttentionVariant::kOptimizedV19:
-    case AttentionVariant::kOptimizedV20: {
+    case AttentionVariant::kOptimizedV20:
+    case AttentionVariant::kOptimizedV21: {
       const int64_t head_tiles = (num_heads + kScoreTileM - 1) / kScoreTileM;
       const int64_t row_tiles = (total_width + kScoreRowsPerBlock - 1) / kScoreRowsPerBlock;
       TORCH_CHECK(total_width > 0, "score-state split requires selected rows");
@@ -4018,6 +4059,27 @@ torch::Tensor launch_ds4_cuda_attention(
       auto score_state = torch::empty(
           {batch_size, num_heads, total_width},
           q.options().dtype(torch::kFloat32));
+      const bool compact_metadata = variant == AttentionVariant::kOptimizedV21;
+      torch::Tensor row_ptr_state;
+      torch::Tensor row_scale_byte_state;
+      torch::Tensor row_valid_state;
+      int64_t* row_ptr_state_ptr = nullptr;
+      uint8_t* row_scale_byte_state_ptr = nullptr;
+      uint8_t* row_valid_state_ptr = nullptr;
+      if (compact_metadata) {
+        row_ptr_state = torch::empty(
+            {batch_size, total_width},
+            q.options().dtype(torch::kInt64));
+        row_scale_byte_state = torch::empty(
+            {batch_size, total_width, static_cast<int64_t>(kScaleCount)},
+            q.options().dtype(torch::kUInt8));
+        row_valid_state = torch::empty(
+            {batch_size, total_width},
+            q.options().dtype(torch::kUInt8));
+        row_ptr_state_ptr = row_ptr_state.data_ptr<int64_t>();
+        row_scale_byte_state_ptr = row_scale_byte_state.data_ptr<uint8_t>();
+        row_valid_state_ptr = row_valid_state.data_ptr<uint8_t>();
+      }
 
       dim3 split_grid(
           static_cast<unsigned int>(batch_size),
@@ -4058,13 +4120,17 @@ torch::Tensor launch_ds4_cuda_attention(
           static_cast<int>(row_tiles),
           partial_max.data_ptr<float>(),
           partial_sum.data_ptr<float>(),
-          score_state.data_ptr<float>());
+          score_state.data_ptr<float>(),
+          row_ptr_state_ptr,
+          row_scale_byte_state_ptr,
+          row_valid_state_ptr);
       if (profile_split) {
         C10_CUDA_CHECK(cudaEventRecord(score_stop, stream));
       }
       C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-      if (variant == AttentionVariant::kOptimizedV20) {
+      if (variant == AttentionVariant::kOptimizedV20 ||
+          variant == AttentionVariant::kOptimizedV21) {
         dim3 finalize_grid(
             static_cast<unsigned int>(batch_size),
             static_cast<unsigned int>(head_tiles),
@@ -4093,6 +4159,9 @@ torch::Tensor launch_ds4_cuda_attention(
             static_cast<int>(total_width),
             static_cast<int>(head_tiles),
             static_cast<int>(row_tiles),
+            compact_metadata ? row_ptr_state.data_ptr<int64_t>() : nullptr,
+            compact_metadata ? row_scale_byte_state.data_ptr<uint8_t>() : nullptr,
+            compact_metadata ? row_valid_state.data_ptr<uint8_t>() : nullptr,
             reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
       } else {
         ds4_cuda_fused_v19_finalize_kernel<<<fused_grid, split_block, 0, stream>>>(
@@ -4813,6 +4882,33 @@ torch::Tensor ds4_cuda_optimized_v20_attention(
       extra_topk_lengths,
       extra_page_size,
       AttentionVariant::kOptimizedV20);
+}
+
+torch::Tensor ds4_cuda_optimized_v21_attention(
+    torch::Tensor q,
+    torch::Tensor swa_k_cache,
+    torch::Tensor swa_indices,
+    torch::Tensor swa_topk_lengths,
+    int64_t swa_page_size,
+    double softmax_scale,
+    torch::Tensor attn_sink,
+    torch::Tensor extra_k_cache,
+    torch::Tensor extra_indices,
+    torch::Tensor extra_topk_lengths,
+    int64_t extra_page_size) {
+  return launch_ds4_cuda_attention(
+      q,
+      swa_k_cache,
+      swa_indices,
+      swa_topk_lengths,
+      swa_page_size,
+      softmax_scale,
+      attn_sink,
+      extra_k_cache,
+      extra_indices,
+      extra_topk_lengths,
+      extra_page_size,
+      AttentionVariant::kOptimizedV21);
 }
 
 torch::Tensor ds4_cuda_reference_scores(
