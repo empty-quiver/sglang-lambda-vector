@@ -53,6 +53,11 @@ constexpr int kV15DimOuterRounds = kV11DimRounds / kV15DimRoundGroups;
 static_assert(
     kV11DimRounds % kV15DimRoundGroups == 0,
     "v15 expects dimension rounds to divide evenly into round groups");
+constexpr int kV22OuterRoundsPerBlock = 2;
+constexpr int kV22OuterRoundBlocks = kV15DimOuterRounds / kV22OuterRoundsPerBlock;
+static_assert(
+    kV15DimOuterRounds % kV22OuterRoundsPerBlock == 0,
+    "v22 expects outer rounds to divide evenly into grouped finalize blocks");
 constexpr int kReduceScaleCacheMaxRowTiles = 16;
 constexpr int kPartialProfileRowSetup = 0;
 constexpr int kPartialProfileScaleCache = 1;
@@ -92,6 +97,7 @@ enum class AttentionVariant : int {
   kOptimizedV19 = 19,
   kOptimizedV20 = 20,
   kOptimizedV21 = 21,
+  kOptimizedV22 = 22,
 };
 
 const char* attention_variant_name(AttentionVariant variant) {
@@ -138,6 +144,8 @@ const char* attention_variant_name(AttentionVariant variant) {
       return "v20";
     case AttentionVariant::kOptimizedV21:
       return "v21";
+    case AttentionVariant::kOptimizedV22:
+      return "v22";
   }
   return "unknown";
 }
@@ -3205,6 +3213,254 @@ __global__ void ds4_cuda_fused_v20_finalize_kernel(
   }
 }
 
+__global__ void ds4_cuda_fused_v22_finalize_kernel(
+    const float* __restrict__ partial_max,
+    const float* __restrict__ partial_sum,
+    const float* __restrict__ score_state,
+    const float* __restrict__ attn_sink,
+    bool has_sink,
+    int batch_size,
+    int num_heads,
+    int total_width,
+    int head_tiles,
+    int row_tiles,
+    const int64_t* __restrict__ row_ptr_state,
+    const uint8_t* __restrict__ row_scale_byte_state,
+    const uint8_t* __restrict__ row_valid_state,
+    __nv_bfloat16* __restrict__ out) {
+  namespace wmma = nvcuda::wmma;
+
+  const int batch = blockIdx.x;
+  const int head_tile = blockIdx.y;
+  const int outer_round_base = blockIdx.z * kV22OuterRoundsPerBlock;
+  const int head_base = head_tile * kScoreTileM;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  if (batch >= batch_size || outer_round_base >= kV15DimOuterRounds) {
+    return;
+  }
+
+  __shared__ float final_max[kScoreTileM];
+  __shared__ float final_sum[kScoreTileM];
+  __shared__ float inv_sum[kScoreTileM];
+  __shared__ const uint8_t* row_ptrs[kScoreRowsPerBlock];
+  __shared__ uint8_t row_valid[kScoreRowsPerBlock];
+  __shared__ float row_scales[kScoreRowsPerBlock][kScaleCount];
+  __shared__ __align__(16) __nv_bfloat16 p_shared[kScoreWarpsPerBlock][kScoreTileElems];
+  __shared__ __align__(16) __nv_bfloat16 v_shared[kV11WarpsPerBlock][kScoreTileElems];
+  __shared__ __align__(16) float pv_shared[kV11WarpsPerBlock][kScoreTileElems];
+  __shared__ __align__(16) float pv_shared_second[kV11WarpsPerBlock][kScoreTileElems];
+
+  if (threadIdx.x < kScoreTileM) {
+    const int head_slot = threadIdx.x;
+    const int head = head_base + head_slot;
+    float m = -INFINITY;
+    if (head < num_heads) {
+      for (int row_tile = 0; row_tile < row_tiles; ++row_tile) {
+        const int64_t state_offset =
+            (((static_cast<int64_t>(batch) * head_tiles + head_tile) * row_tiles + row_tile) *
+                 kScoreTileM +
+             head_slot);
+        const float l = partial_sum[state_offset];
+        if (l > 0.0f) {
+          m = fmaxf(m, partial_max[state_offset]);
+        }
+      }
+      if (has_sink) {
+        m = fmaxf(m, attn_sink[head]);
+      }
+    }
+
+    float l_total = 0.0f;
+    if (head < num_heads) {
+      for (int row_tile = 0; row_tile < row_tiles; ++row_tile) {
+        const int64_t state_offset =
+            (((static_cast<int64_t>(batch) * head_tiles + head_tile) * row_tiles + row_tile) *
+                 kScoreTileM +
+             head_slot);
+        const float l = partial_sum[state_offset];
+        if (l > 0.0f) {
+          l_total += l * expf(partial_max[state_offset] - m);
+        }
+      }
+      if (has_sink) {
+        l_total += expf(attn_sink[head] - m);
+      }
+    }
+    final_max[head_slot] = m;
+    final_sum[head_slot] = l_total;
+    inv_sum[head_slot] = l_total > 0.0f ? 1.0f / l_total : 0.0f;
+  }
+  __syncthreads();
+
+  if (warp < kV11WarpsPerBlock) {
+    const int dim_round_group = warp / kV11DimGroups;
+    const int dim_group = warp - dim_round_group * kV11DimGroups;
+
+    wmma::fragment<wmma::matrix_a, kScoreTileM, kScoreTileN, kScoreTileK, __nv_bfloat16, wmma::row_major>
+        p_frag;
+    wmma::fragment<wmma::matrix_b, kScoreTileM, kScoreTileN, kScoreTileK, __nv_bfloat16, wmma::row_major>
+        v_frag;
+    wmma::fragment<wmma::accumulator, kScoreTileM, kScoreTileN, kScoreTileK, float>
+        pv_acc_frag0;
+    wmma::fragment<wmma::accumulator, kScoreTileM, kScoreTileN, kScoreTileK, float>
+        pv_acc_frag1;
+    wmma::fill_fragment(pv_acc_frag0, 0.0f);
+    wmma::fill_fragment(pv_acc_frag1, 0.0f);
+
+    for (int row_tile = 0; row_tile < row_tiles; ++row_tile) {
+      if (threadIdx.x < kScoreRowsPerBlock) {
+        const int row = row_tile * kScoreRowsPerBlock + threadIdx.x;
+        bool valid = false;
+        const uint8_t* packed = nullptr;
+        if (row < total_width) {
+          const int64_t meta_offset = static_cast<int64_t>(batch) * total_width + row;
+          valid = row_valid_state[meta_offset] != 0;
+          packed = valid
+              ? reinterpret_cast<const uint8_t*>(
+                    static_cast<uintptr_t>(row_ptr_state[meta_offset]))
+              : nullptr;
+        }
+        row_ptrs[threadIdx.x] = packed;
+        row_valid[threadIdx.x] = valid ? 1 : 0;
+      }
+      __syncthreads();
+
+      if (threadIdx.x < kScoreRowsPerBlock * kScaleCount) {
+        const int row_slot = threadIdx.x / kScaleCount;
+        const int local_scale_slot = threadIdx.x - row_slot * kScaleCount;
+        const int row = row_tile * kScoreRowsPerBlock + row_slot;
+        if (row < total_width) {
+          const int64_t meta_offset =
+              (static_cast<int64_t>(batch) * total_width + row) * kScaleCount +
+              local_scale_slot;
+          row_scales[row_slot][local_scale_slot] =
+              row_valid[row_slot]
+                  ? exp2f(static_cast<float>(row_scale_byte_state[meta_offset]) - 127.0f)
+                  : 0.0f;
+        } else {
+          row_scales[row_slot][local_scale_slot] = 0.0f;
+        }
+      }
+      __syncthreads();
+
+      if (warp < kScoreWarpsPerBlock) {
+        const int row_group = warp;
+        for (int idx = lane; idx < kScoreTileElems; idx += 32) {
+          const int head_slot = idx / kScoreTileN;
+          const int row_lane = idx - head_slot * kScoreTileN;
+          const int row_slot = row_group * kScoreTileN + row_lane;
+          const int row = row_tile * kScoreRowsPerBlock + row_slot;
+          const int head = head_base + head_slot;
+          float p = 0.0f;
+          if (head < num_heads && row < total_width && row_valid[row_slot]) {
+            const float score =
+                score_state[(static_cast<int64_t>(batch) * num_heads + head) * total_width +
+                            row];
+            p = expf(score - final_max[head_slot]);
+          }
+          p_shared[row_group][idx] = __float2bfloat16(p);
+        }
+      }
+      __syncthreads();
+
+#pragma unroll
+      for (int outer_inner = 0; outer_inner < kV22OuterRoundsPerBlock; ++outer_inner) {
+        const int outer_round = outer_round_base + outer_inner;
+        if (outer_round >= kV15DimOuterRounds) {
+          continue;
+        }
+        const int dim_round = outer_round * kV15DimRoundGroups + dim_round_group;
+        const int dim_base = (dim_round * kV11DimGroups + dim_group) * kScoreTileN;
+        const bool nope_tile = dim_base < kNopeDim;
+        const int scale_slot = dim_base / kScaleGroup;
+
+#pragma unroll
+        for (int row_group = 0; row_group < kScoreWarpsPerBlock; ++row_group) {
+          for (int idx = lane; idx < kScoreTileElems; idx += 32) {
+            const int k_slot = idx / kScoreTileN;
+            const int dim_slot = idx - k_slot * kScoreTileN;
+            const int row_slot = row_group * kScoreTileN + k_slot;
+            const int dim = dim_base + dim_slot;
+            float v = 0.0f;
+            if (row_valid[row_slot]) {
+              const uint8_t* row = row_ptrs[row_slot];
+              if (nope_tile) {
+                v = fp8_e4m3fn_to_float(row[dim]) * row_scales[row_slot][scale_slot];
+              } else {
+                v = bf16_bytes_to_float(row + kNopeDim + (dim - kNopeDim) * 2);
+              }
+            }
+            v_shared[warp][idx] = __float2bfloat16(v);
+          }
+          __syncwarp();
+
+          wmma::load_matrix_sync(p_frag, p_shared[row_group], kScoreTileN);
+          wmma::load_matrix_sync(v_frag, v_shared[warp], kScoreTileN);
+          if (outer_inner == 0) {
+            wmma::mma_sync(pv_acc_frag0, p_frag, v_frag, pv_acc_frag0);
+          } else {
+            wmma::mma_sync(pv_acc_frag1, p_frag, v_frag, pv_acc_frag1);
+          }
+          __syncwarp();
+        }
+      }
+      __syncthreads();
+    }
+
+    wmma::store_matrix_sync(pv_shared[warp], pv_acc_frag0, kScoreTileN, wmma::mem_row_major);
+    wmma::store_matrix_sync(
+        pv_shared_second[warp], pv_acc_frag1, kScoreTileN, wmma::mem_row_major);
+  }
+  __syncthreads();
+
+  for (int idx = threadIdx.x;
+       idx < kV15DimRoundGroups * kV11DimGroups * kScoreTileElems;
+       idx += blockDim.x) {
+    const int dim_round_group = idx / (kV11DimGroups * kScoreTileElems);
+    const int rem = idx - dim_round_group * kV11DimGroups * kScoreTileElems;
+    const int dim_group = rem / kScoreTileElems;
+    const int tile_idx = rem - dim_group * kScoreTileElems;
+    const int head_slot = tile_idx / kScoreTileN;
+    const int dim_slot = tile_idx - head_slot * kScoreTileN;
+    const int head = head_base + head_slot;
+    const int dim_round = outer_round_base * kV15DimRoundGroups + dim_round_group;
+    const int dim = (dim_round * kV11DimGroups + dim_group) * kScoreTileN + dim_slot;
+    const int result_warp = dim_round_group * kV11DimGroups + dim_group;
+    if (head < num_heads) {
+      const float value = pv_shared[result_warp][tile_idx] * inv_sum[head_slot];
+      const int64_t out_offset =
+          (static_cast<int64_t>(batch) * num_heads + head) * kHeadDim + dim;
+      out[out_offset] = __float2bfloat16(value);
+    }
+  }
+  __syncthreads();
+
+  const int second_outer_round = outer_round_base + 1;
+  if (second_outer_round < kV15DimOuterRounds) {
+    for (int idx = threadIdx.x;
+         idx < kV15DimRoundGroups * kV11DimGroups * kScoreTileElems;
+         idx += blockDim.x) {
+      const int dim_round_group = idx / (kV11DimGroups * kScoreTileElems);
+      const int rem = idx - dim_round_group * kV11DimGroups * kScoreTileElems;
+      const int dim_group = rem / kScoreTileElems;
+      const int tile_idx = rem - dim_group * kScoreTileElems;
+      const int head_slot = tile_idx / kScoreTileN;
+      const int dim_slot = tile_idx - head_slot * kScoreTileN;
+      const int head = head_base + head_slot;
+      const int dim_round = second_outer_round * kV15DimRoundGroups + dim_round_group;
+      const int dim = (dim_round * kV11DimGroups + dim_group) * kScoreTileN + dim_slot;
+      const int result_warp = dim_round_group * kV11DimGroups + dim_group;
+      if (head < num_heads) {
+        const float value = pv_shared_second[result_warp][tile_idx] * inv_sum[head_slot];
+        const int64_t out_offset =
+            (static_cast<int64_t>(batch) * num_heads + head) * kHeadDim + dim;
+        out[out_offset] = __float2bfloat16(value);
+      }
+    }
+  }
+}
+
 int64_t flattened_batch(torch::Tensor q) {
   TORCH_CHECK(q.dim() >= 3, "q must have shape [..., heads, 512], got ", q.sizes());
   TORCH_CHECK(q.size(-1) == kHeadDim, "q head dim must be 512, got ", q.size(-1));
@@ -4048,7 +4304,8 @@ torch::Tensor launch_ds4_cuda_attention(
     }
     case AttentionVariant::kOptimizedV19:
     case AttentionVariant::kOptimizedV20:
-    case AttentionVariant::kOptimizedV21: {
+    case AttentionVariant::kOptimizedV21:
+    case AttentionVariant::kOptimizedV22: {
       const int64_t head_tiles = (num_heads + kScoreTileM - 1) / kScoreTileM;
       const int64_t row_tiles = (total_width + kScoreRowsPerBlock - 1) / kScoreRowsPerBlock;
       TORCH_CHECK(total_width > 0, "score-state split requires selected rows");
@@ -4059,7 +4316,8 @@ torch::Tensor launch_ds4_cuda_attention(
       auto score_state = torch::empty(
           {batch_size, num_heads, total_width},
           q.options().dtype(torch::kFloat32));
-      const bool compact_metadata = variant == AttentionVariant::kOptimizedV21;
+      const bool compact_metadata = variant == AttentionVariant::kOptimizedV21 ||
+          variant == AttentionVariant::kOptimizedV22;
       torch::Tensor row_ptr_state;
       torch::Tensor row_scale_byte_state;
       torch::Tensor row_valid_state;
@@ -4129,8 +4387,28 @@ torch::Tensor launch_ds4_cuda_attention(
       }
       C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-      if (variant == AttentionVariant::kOptimizedV20 ||
-          variant == AttentionVariant::kOptimizedV21) {
+      if (variant == AttentionVariant::kOptimizedV22) {
+        dim3 finalize_grid(
+            static_cast<unsigned int>(batch_size),
+            static_cast<unsigned int>(head_tiles),
+            static_cast<unsigned int>(kV22OuterRoundBlocks));
+        ds4_cuda_fused_v22_finalize_kernel<<<finalize_grid, split_block, 0, stream>>>(
+            partial_max.data_ptr<float>(),
+            partial_sum.data_ptr<float>(),
+            score_state.data_ptr<float>(),
+            has_sink ? attn_sink.data_ptr<float>() : nullptr,
+            has_sink,
+            static_cast<int>(batch_size),
+            static_cast<int>(num_heads),
+            static_cast<int>(total_width),
+            static_cast<int>(head_tiles),
+            static_cast<int>(row_tiles),
+            row_ptr_state.data_ptr<int64_t>(),
+            row_scale_byte_state.data_ptr<uint8_t>(),
+            row_valid_state.data_ptr<uint8_t>(),
+            reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
+      } else if (variant == AttentionVariant::kOptimizedV20 ||
+                 variant == AttentionVariant::kOptimizedV21) {
         dim3 finalize_grid(
             static_cast<unsigned int>(batch_size),
             static_cast<unsigned int>(head_tiles),
@@ -4909,6 +5187,33 @@ torch::Tensor ds4_cuda_optimized_v21_attention(
       extra_topk_lengths,
       extra_page_size,
       AttentionVariant::kOptimizedV21);
+}
+
+torch::Tensor ds4_cuda_optimized_v22_attention(
+    torch::Tensor q,
+    torch::Tensor swa_k_cache,
+    torch::Tensor swa_indices,
+    torch::Tensor swa_topk_lengths,
+    int64_t swa_page_size,
+    double softmax_scale,
+    torch::Tensor attn_sink,
+    torch::Tensor extra_k_cache,
+    torch::Tensor extra_indices,
+    torch::Tensor extra_topk_lengths,
+    int64_t extra_page_size) {
+  return launch_ds4_cuda_attention(
+      q,
+      swa_k_cache,
+      swa_indices,
+      swa_topk_lengths,
+      swa_page_size,
+      softmax_scale,
+      attn_sink,
+      extra_k_cache,
+      extra_indices,
+      extra_topk_lengths,
+      extra_page_size,
+      AttentionVariant::kOptimizedV22);
 }
 
 torch::Tensor ds4_cuda_reference_scores(
