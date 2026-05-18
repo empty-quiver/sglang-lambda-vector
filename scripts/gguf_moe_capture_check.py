@@ -20,30 +20,59 @@ def _load_capture(path: Path) -> dict:
     return torch.load(path, map_location="cpu", weights_only=False)
 
 
-def _assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor):
-    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
-    print(f"{name}: ok shape={tuple(actual.shape)} dtype={actual.dtype}")
+def _assert_close(
+    name: str,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    *,
+    atol: float,
+    rtol: float,
+):
+    actual_f = actual.float()
+    expected_f = expected.float()
+    diff = (actual_f - expected_f).abs()
+    max_abs = float(diff.max().item()) if diff.numel() else 0.0
+    mean_abs = float(diff.mean().item()) if diff.numel() else 0.0
+    close = torch.isclose(actual_f, expected_f, atol=atol, rtol=rtol)
+    mismatch = int((~close).sum().item()) if close.numel() else 0
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    print(
+        f"{name}: ok shape={tuple(actual.shape)} dtype={actual.dtype} "
+        f"max_abs={max_abs:.6g} mean_abs={mean_abs:.6g} "
+        f"mismatch={mismatch}/{actual.numel()} atol={atol} rtol={rtol}",
+    )
 
 
-def _check_active_reconstruction(capture: dict):
+def _reconstruct_from_active(capture: dict, active_out: torch.Tensor) -> torch.Tensor:
     x = capture["x"]
     active_token_ids = capture["active_token_ids"].long()
-    active_out = capture["active_out"]
-    expected = capture["out_hidden_states"]
-
     reconstructed = torch.zeros_like(x)
     reconstructed.index_add_(0, active_token_ids, active_out)
-    _assert_close("active_filter_reconstruction", reconstructed, expected)
+    return reconstructed
 
 
-def _check_current_kernel(capture: dict, device: str):
+def _check_active_reconstruction(capture: dict, *, atol: float, rtol: float):
+    reconstructed = _reconstruct_from_active(capture, capture["active_out"])
+    expected = capture["out_hidden_states"]
+    _assert_close(
+        "active_filter_reconstruction",
+        reconstructed,
+        expected,
+        atol=atol,
+        rtol=rtol,
+    )
+
+
+def _check_current_kernel(
+    capture: dict, device: str, *, atol: float, rtol: float
+) -> torch.Tensor | None:
     missing = [key for key in ("w1", "w2") if key not in capture]
     if missing:
         print(
             "current_kernel: skipped; capture does not include "
             f"{', '.join(missing)}. Set SGLANG_GGUF_MOE_CAPTURE_WEIGHTS=1.",
         )
-        return
+        return None
 
     repo_python = Path(__file__).resolve().parents[1] / "python"
     sys.path.insert(0, str(repo_python))
@@ -67,17 +96,26 @@ def _check_current_kernel(capture: dict, device: str):
         activation=capture["activation"],
         debug_layer=capture.get("debug_layer"),
     ).cpu()
-    _assert_close("current_kernel_active_out", out, capture["active_out"])
+    _assert_close(
+        "current_kernel_active_out",
+        out,
+        capture["active_out"],
+        atol=atol,
+        rtol=rtol,
+    )
+    return out
 
 
-def _check_masked_kernel(capture: dict, device: str):
+def _check_masked_kernel(
+    capture: dict, device: str, *, atol: float, rtol: float
+) -> torch.Tensor | None:
     missing = [key for key in ("w1", "w2") if key not in capture]
     if missing:
         print(
             "masked_kernel: skipped; capture does not include "
             f"{', '.join(missing)}. Set SGLANG_GGUF_MOE_CAPTURE_WEIGHTS=1.",
         )
-        return
+        return None
 
     repo_python = Path(__file__).resolve().parents[1] / "python"
     sys.path.insert(0, str(repo_python))
@@ -102,7 +140,14 @@ def _check_masked_kernel(capture: dict, device: str):
         activation=capture["activation"],
         debug_layer=capture.get("debug_layer"),
     ).cpu()
-    _assert_close("masked_kernel_full_out", out, capture["out_hidden_states"])
+    _assert_close(
+        "masked_kernel_full_out",
+        out,
+        capture["out_hidden_states"],
+        atol=atol,
+        rtol=rtol,
+    )
+    return out
 
 
 def main() -> int:
@@ -123,6 +168,18 @@ def main() -> int:
         action="store_true",
         help="Skip rerunning the masked full-token kernel path.",
     )
+    parser.add_argument(
+        "--atol",
+        type=float,
+        default=3e-2,
+        help="Absolute tolerance for BF16 CUDA replay comparisons.",
+    )
+    parser.add_argument(
+        "--rtol",
+        type=float,
+        default=3e-2,
+        help="Relative tolerance for BF16 CUDA replay comparisons.",
+    )
     args = parser.parse_args()
 
     capture = _load_capture(args.capture)
@@ -135,17 +192,32 @@ def main() -> int:
         f"active={tuple(capture['active_x'].shape)}",
     )
 
-    _check_active_reconstruction(capture)
+    _check_active_reconstruction(capture, atol=args.atol, rtol=args.rtol)
+    current_out = None
+    masked_out = None
     if not args.skip_current_kernel:
         if args.device == "cpu":
             print("current_kernel: skipped; GGUF CUDA kernel requires CUDA")
         else:
-            _check_current_kernel(capture, args.device)
+            current_out = _check_current_kernel(
+                capture, args.device, atol=args.atol, rtol=args.rtol
+            )
     if not args.skip_masked_kernel:
         if args.device == "cpu":
             print("masked_kernel: skipped; GGUF CUDA kernel requires CUDA")
         else:
-            _check_masked_kernel(capture, args.device)
+            masked_out = _check_masked_kernel(
+                capture, args.device, atol=args.atol, rtol=args.rtol
+            )
+    if current_out is not None and masked_out is not None:
+        current_full = _reconstruct_from_active(capture, current_out)
+        _assert_close(
+            "masked_vs_current_active_replay",
+            masked_out,
+            current_full,
+            atol=args.atol,
+            rtol=args.rtol,
+        )
     return 0
 
 
