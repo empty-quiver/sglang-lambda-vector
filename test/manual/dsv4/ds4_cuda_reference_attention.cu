@@ -37,6 +37,7 @@ constexpr int kScoreRowsPerBlock = kScoreTileN * kScoreWarpsPerBlock;
 constexpr int kScoreThreads = 32 * kScoreWarpsPerBlock;
 constexpr int kV7Threads = 512;
 constexpr int kV7AccElems = kScoreTileM * kHeadDim;
+constexpr int kV8Threads = kV7Threads;
 
 enum class AttentionVariant : int {
   kReference = 0,
@@ -46,6 +47,7 @@ enum class AttentionVariant : int {
   kOptimizedV4 = 4,
   kOptimizedV5 = 5,
   kOptimizedV7 = 7,
+  kOptimizedV8 = 8,
 };
 
 __device__ __forceinline__ float fp8_e4m3fn_to_float(uint8_t bits) {
@@ -1558,6 +1560,307 @@ __global__ void ds4_cuda_fused_v7_mma_attention_kernel(
   }
 }
 
+__global__ void ds4_cuda_fused_v8_mma_partial_kernel(
+    const __nv_bfloat16* __restrict__ q,
+    const uint8_t* __restrict__ swa_cache,
+    const int32_t* __restrict__ swa_indices,
+    const int32_t* __restrict__ swa_lengths,
+    int swa_width,
+    int swa_page_size,
+    int swa_row_stride,
+    const uint8_t* __restrict__ extra_cache,
+    const int32_t* __restrict__ extra_indices,
+    const int32_t* __restrict__ extra_lengths,
+    int extra_width,
+    int extra_page_size,
+    int extra_row_stride,
+    bool has_extra,
+    float softmax_scale,
+    int batch_size,
+    int num_heads,
+    int total_width,
+    int head_tiles,
+    int row_tiles,
+    float* __restrict__ partial_max,
+    float* __restrict__ partial_sum,
+    float* __restrict__ partial_acc) {
+  namespace wmma = nvcuda::wmma;
+
+  const int batch = blockIdx.x;
+  const int head_tile = blockIdx.y;
+  const int row_tile = blockIdx.z;
+  const int head_base = head_tile * kScoreTileM;
+  const int tile_row_base = row_tile * kScoreRowsPerBlock;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  if (batch >= batch_size) {
+    return;
+  }
+
+  __shared__ __align__(16) __nv_bfloat16
+      q_shared[kScoreWarpsPerBlock][kScoreTileM * kScoreTileK];
+  __shared__ __align__(16) __nv_bfloat16
+      k_shared[kScoreWarpsPerBlock][kScoreTileK * kScoreTileN];
+  __shared__ __align__(16) float score_shared[kScoreWarpsPerBlock][kScoreTileElems];
+  __shared__ __align__(16) float weight_shared[kScoreWarpsPerBlock][kScoreTileElems];
+  __shared__ __align__(16) float acc_shared[kV7AccElems];
+  __shared__ const uint8_t* row_ptrs[kScoreRowsPerBlock];
+  __shared__ uint8_t row_valid[kScoreRowsPerBlock];
+  __shared__ float tile_max_shared[kScoreTileM];
+  __shared__ float tile_sum_shared[kScoreTileM];
+
+  for (int idx = threadIdx.x; idx < kV7AccElems; idx += blockDim.x) {
+    acc_shared[idx] = 0.0f;
+  }
+  if (threadIdx.x < kScoreTileM) {
+    tile_max_shared[threadIdx.x] = -INFINITY;
+    tile_sum_shared[threadIdx.x] = 0.0f;
+  }
+  if (threadIdx.x < kScoreRowsPerBlock) {
+    const int row = tile_row_base + threadIdx.x;
+    bool valid = false;
+    const uint8_t* packed = nullptr;
+    if (row < total_width) {
+      packed = selected_combined_row_ptr(
+          swa_cache,
+          swa_indices,
+          swa_lengths,
+          swa_width,
+          swa_page_size,
+          swa_row_stride,
+          extra_cache,
+          extra_indices,
+          extra_lengths,
+          extra_width,
+          extra_page_size,
+          extra_row_stride,
+          has_extra,
+          batch,
+          row,
+          valid);
+    }
+    row_ptrs[threadIdx.x] = packed;
+    row_valid[threadIdx.x] = valid ? 1 : 0;
+  }
+  __syncthreads();
+
+  if (warp < kScoreWarpsPerBlock) {
+    wmma::fragment<wmma::matrix_a, kScoreTileM, kScoreTileN, kScoreTileK, __nv_bfloat16, wmma::row_major>
+        q_frag;
+    wmma::fragment<wmma::matrix_b, kScoreTileM, kScoreTileN, kScoreTileK, __nv_bfloat16, wmma::row_major>
+        k_frag;
+    wmma::fragment<wmma::accumulator, kScoreTileM, kScoreTileN, kScoreTileK, float>
+        acc_frag;
+    wmma::fill_fragment(acc_frag, 0.0f);
+
+    const int warp_row_base = warp * kScoreTileN;
+    for (int dim_base = 0; dim_base < kHeadDim; dim_base += kScoreTileK) {
+      for (int idx = lane; idx < kScoreTileElems; idx += 32) {
+        const int q_head_slot = idx / kScoreTileK;
+        const int q_dim_slot = idx - q_head_slot * kScoreTileK;
+        const int head = head_base + q_head_slot;
+        const int dim = dim_base + q_dim_slot;
+        const int64_t q_offset =
+            (static_cast<int64_t>(batch) * num_heads + head) * kHeadDim + dim;
+        q_shared[warp][idx] = head < num_heads ? q[q_offset] : __float2bfloat16(0.0f);
+
+        const int k_dim_slot = idx / kScoreTileN;
+        const int k_row_slot = idx - k_dim_slot * kScoreTileN;
+        const int local_row = warp_row_base + k_row_slot;
+        const bool valid = row_valid[local_row] != 0;
+        const uint8_t* packed = row_ptrs[local_row];
+        const float value =
+            valid ? load_dsv4_packed_dim(packed, dim_base + k_dim_slot) : 0.0f;
+        k_shared[warp][idx] = __float2bfloat16(value);
+      }
+      __syncwarp();
+
+      wmma::load_matrix_sync(q_frag, q_shared[warp], kScoreTileK);
+      wmma::load_matrix_sync(k_frag, k_shared[warp], kScoreTileN);
+      wmma::mma_sync(acc_frag, q_frag, k_frag, acc_frag);
+      __syncwarp();
+    }
+
+    wmma::store_matrix_sync(score_shared[warp], acc_frag, kScoreTileN, wmma::mem_row_major);
+  }
+  __syncthreads();
+
+  if (threadIdx.x < kScoreTileM) {
+    const int head_slot = threadIdx.x;
+    const int head = head_base + head_slot;
+    float tile_max = -INFINITY;
+#pragma unroll
+    for (int row_slot = 0; row_slot < kScoreRowsPerBlock; ++row_slot) {
+      if (head < num_heads && row_valid[row_slot]) {
+        const int row_warp = row_slot / kScoreTileN;
+        const int row_lane = row_slot - row_warp * kScoreTileN;
+        const float score =
+            score_shared[row_warp][head_slot * kScoreTileN + row_lane] * softmax_scale;
+        tile_max = fmaxf(tile_max, score);
+      }
+    }
+
+    float tile_sum = 0.0f;
+#pragma unroll
+    for (int row_slot = 0; row_slot < kScoreRowsPerBlock; ++row_slot) {
+      float weight = 0.0f;
+      if (head < num_heads && row_valid[row_slot]) {
+        const int row_warp = row_slot / kScoreTileN;
+        const int row_lane = row_slot - row_warp * kScoreTileN;
+        const float score =
+            score_shared[row_warp][head_slot * kScoreTileN + row_lane] * softmax_scale;
+        weight = expf(score - tile_max);
+        tile_sum += weight;
+      }
+      const int row_warp = row_slot / kScoreTileN;
+      const int row_lane = row_slot - row_warp * kScoreTileN;
+      weight_shared[row_warp][head_slot * kScoreTileN + row_lane] = weight;
+    }
+    tile_max_shared[head_slot] = tile_max;
+    tile_sum_shared[head_slot] = tile_sum;
+
+    const int64_t state_offset =
+        (((static_cast<int64_t>(batch) * head_tiles + head_tile) * row_tiles + row_tile) *
+             kScoreTileM +
+         head_slot);
+    partial_max[state_offset] = tile_max;
+    partial_sum[state_offset] = tile_sum;
+  }
+  __syncthreads();
+
+  for (int dim = threadIdx.x; dim < kHeadDim; dim += blockDim.x) {
+    float values[kScoreTileM];
+#pragma unroll
+    for (int head_slot = 0; head_slot < kScoreTileM; ++head_slot) {
+      values[head_slot] = 0.0f;
+    }
+
+#pragma unroll
+    for (int row_slot = 0; row_slot < kScoreRowsPerBlock; ++row_slot) {
+      if (row_valid[row_slot]) {
+        const int row_warp = row_slot / kScoreTileN;
+        const int row_lane = row_slot - row_warp * kScoreTileN;
+        const float v = load_dsv4_packed_dim(row_ptrs[row_slot], dim);
+#pragma unroll
+        for (int head_slot = 0; head_slot < kScoreTileM; ++head_slot) {
+          const int head = head_base + head_slot;
+          if (head < num_heads) {
+            const float weight = weight_shared[row_warp][head_slot * kScoreTileN + row_lane];
+            values[head_slot] += weight * v;
+          }
+        }
+      }
+    }
+
+#pragma unroll
+    for (int head_slot = 0; head_slot < kScoreTileM; ++head_slot) {
+      const int head = head_base + head_slot;
+      const int64_t acc_offset =
+          ((((static_cast<int64_t>(batch) * head_tiles + head_tile) * row_tiles + row_tile) *
+                kScoreTileM +
+            head_slot) *
+               kHeadDim +
+           dim);
+      partial_acc[acc_offset] = head < num_heads ? values[head_slot] : 0.0f;
+    }
+  }
+}
+
+__global__ void ds4_cuda_fused_v8_reduce_kernel(
+    const float* __restrict__ partial_max,
+    const float* __restrict__ partial_sum,
+    const float* __restrict__ partial_acc,
+    const float* __restrict__ attn_sink,
+    bool has_sink,
+    int batch_size,
+    int num_heads,
+    int head_tiles,
+    int row_tiles,
+    __nv_bfloat16* __restrict__ out) {
+  const int batch = blockIdx.x;
+  const int head_tile = blockIdx.y;
+  const int head_base = head_tile * kScoreTileM;
+  if (batch >= batch_size) {
+    return;
+  }
+
+  __shared__ float final_max[kScoreTileM];
+  __shared__ float final_sum[kScoreTileM];
+  __shared__ float inv_sum[kScoreTileM];
+
+  if (threadIdx.x < kScoreTileM) {
+    const int head_slot = threadIdx.x;
+    const int head = head_base + head_slot;
+    float m = -INFINITY;
+    if (head < num_heads) {
+      for (int row_tile = 0; row_tile < row_tiles; ++row_tile) {
+        const int64_t state_offset =
+            (((static_cast<int64_t>(batch) * head_tiles + head_tile) * row_tiles + row_tile) *
+                 kScoreTileM +
+             head_slot);
+        const float l = partial_sum[state_offset];
+        if (l > 0.0f) {
+          m = fmaxf(m, partial_max[state_offset]);
+        }
+      }
+      if (has_sink) {
+        m = fmaxf(m, attn_sink[head]);
+      }
+    }
+
+    float l_total = 0.0f;
+    if (head < num_heads) {
+      for (int row_tile = 0; row_tile < row_tiles; ++row_tile) {
+        const int64_t state_offset =
+            (((static_cast<int64_t>(batch) * head_tiles + head_tile) * row_tiles + row_tile) *
+                 kScoreTileM +
+             head_slot);
+        const float l = partial_sum[state_offset];
+        if (l > 0.0f) {
+          l_total += l * expf(partial_max[state_offset] - m);
+        }
+      }
+      if (has_sink) {
+        l_total += expf(attn_sink[head] - m);
+      }
+    }
+
+    final_max[head_slot] = m;
+    final_sum[head_slot] = l_total;
+    inv_sum[head_slot] = l_total > 0.0f ? 1.0f / l_total : 0.0f;
+  }
+  __syncthreads();
+
+  for (int idx = threadIdx.x; idx < kV7AccElems; idx += blockDim.x) {
+    const int head_slot = idx / kHeadDim;
+    const int dim = idx - head_slot * kHeadDim;
+    const int head = head_base + head_slot;
+    if (head < num_heads) {
+      float acc = 0.0f;
+      for (int row_tile = 0; row_tile < row_tiles; ++row_tile) {
+        const int64_t state_offset =
+            (((static_cast<int64_t>(batch) * head_tiles + head_tile) * row_tiles + row_tile) *
+                 kScoreTileM +
+             head_slot);
+        const float l = partial_sum[state_offset];
+        if (l > 0.0f) {
+          const float scale = expf(partial_max[state_offset] - final_max[head_slot]);
+          const int64_t acc_offset =
+              ((((static_cast<int64_t>(batch) * head_tiles + head_tile) * row_tiles + row_tile) *
+                    kScoreTileM +
+                head_slot) *
+                   kHeadDim +
+               dim);
+          acc += partial_acc[acc_offset] * scale;
+        }
+      }
+      const int64_t out_offset =
+          (static_cast<int64_t>(batch) * num_heads + head) * kHeadDim + dim;
+      out[out_offset] = __float2bfloat16(acc * inv_sum[head_slot]);
+    }
+  }
+}
+
 int64_t flattened_batch(torch::Tensor q) {
   TORCH_CHECK(q.dim() >= 3, "q must have shape [..., heads, 512], got ", q.sizes());
   TORCH_CHECK(q.size(-1) == kHeadDim, "q head dim must be 512, got ", q.size(-1));
@@ -1648,6 +1951,7 @@ torch::Tensor launch_ds4_cuda_attention(
   dim3 block(kThreads);
   dim3 score_block(kScoreThreads);
   dim3 fused_block(kV7Threads);
+  dim3 split_block(kV8Threads);
   switch (variant) {
     case AttentionVariant::kReference:
       ds4_cuda_reference_attention_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
@@ -1817,6 +2121,64 @@ torch::Tensor launch_ds4_cuda_attention(
               static_cast<int>(total_width),
               reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
       break;
+    case AttentionVariant::kOptimizedV8: {
+      const int64_t head_tiles = (num_heads + kScoreTileM - 1) / kScoreTileM;
+      const int64_t row_tiles = (total_width + kScoreRowsPerBlock - 1) / kScoreRowsPerBlock;
+      auto partial_max = torch::empty(
+          {batch_size, head_tiles, row_tiles, static_cast<int64_t>(kScoreTileM)},
+          q.options().dtype(torch::kFloat32));
+      auto partial_sum = torch::empty_like(partial_max);
+      auto partial_acc = torch::empty(
+          {batch_size,
+           head_tiles,
+           row_tiles,
+           static_cast<int64_t>(kScoreTileM),
+           static_cast<int64_t>(kHeadDim)},
+          q.options().dtype(torch::kFloat32));
+      dim3 split_grid(
+          static_cast<unsigned int>(batch_size),
+          static_cast<unsigned int>(head_tiles),
+          static_cast<unsigned int>(row_tiles));
+      ds4_cuda_fused_v8_mma_partial_kernel
+          <<<split_grid, split_block, 0, at::cuda::getCurrentCUDAStream()>>>(
+              reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
+              swa_k_cache.data_ptr<uint8_t>(),
+              swa_indices.data_ptr<int32_t>(),
+              swa_topk_lengths.data_ptr<int32_t>(),
+              static_cast<int>(swa_width),
+              static_cast<int>(swa_page_size),
+              static_cast<int>(swa_k_cache.size(3)),
+              has_extra ? extra_k_cache.data_ptr<uint8_t>() : nullptr,
+              has_extra ? extra_indices.data_ptr<int32_t>() : nullptr,
+              has_extra ? extra_topk_lengths.data_ptr<int32_t>() : nullptr,
+              static_cast<int>(extra_width),
+              static_cast<int>(extra_page_size),
+              has_extra ? static_cast<int>(extra_k_cache.size(3)) : 0,
+              has_extra,
+              static_cast<float>(softmax_scale),
+              static_cast<int>(batch_size),
+              static_cast<int>(num_heads),
+              static_cast<int>(total_width),
+              static_cast<int>(head_tiles),
+              static_cast<int>(row_tiles),
+              partial_max.data_ptr<float>(),
+              partial_sum.data_ptr<float>(),
+              partial_acc.data_ptr<float>());
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      ds4_cuda_fused_v8_reduce_kernel
+          <<<fused_grid, split_block, 0, at::cuda::getCurrentCUDAStream()>>>(
+              partial_max.data_ptr<float>(),
+              partial_sum.data_ptr<float>(),
+              partial_acc.data_ptr<float>(),
+              has_sink ? attn_sink.data_ptr<float>() : nullptr,
+              has_sink,
+              static_cast<int>(batch_size),
+              static_cast<int>(num_heads),
+              static_cast<int>(head_tiles),
+              static_cast<int>(row_tiles),
+              reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
+      break;
+    }
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
@@ -2131,6 +2493,33 @@ torch::Tensor ds4_cuda_optimized_v7_attention(
       extra_topk_lengths,
       extra_page_size,
       AttentionVariant::kOptimizedV7);
+}
+
+torch::Tensor ds4_cuda_optimized_v8_attention(
+    torch::Tensor q,
+    torch::Tensor swa_k_cache,
+    torch::Tensor swa_indices,
+    torch::Tensor swa_topk_lengths,
+    int64_t swa_page_size,
+    double softmax_scale,
+    torch::Tensor attn_sink,
+    torch::Tensor extra_k_cache,
+    torch::Tensor extra_indices,
+    torch::Tensor extra_topk_lengths,
+    int64_t extra_page_size) {
+  return launch_ds4_cuda_attention(
+      q,
+      swa_k_cache,
+      swa_indices,
+      swa_topk_lengths,
+      swa_page_size,
+      softmax_scale,
+      attn_sink,
+      extra_k_cache,
+      extra_indices,
+      extra_topk_lengths,
+      extra_page_size,
+      AttentionVariant::kOptimizedV8);
 }
 
 torch::Tensor ds4_cuda_reference_scores(
