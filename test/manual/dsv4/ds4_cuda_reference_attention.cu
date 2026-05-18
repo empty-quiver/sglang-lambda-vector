@@ -1,10 +1,13 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
+#include <cuda_runtime.h>
 #include <mma.h>
 #include <torch/extension.h>
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <limits>
 
@@ -64,6 +67,47 @@ enum class AttentionVariant : int {
   kOptimizedV14 = 14,
   kOptimizedV15 = 15,
 };
+
+const char* attention_variant_name(AttentionVariant variant) {
+  switch (variant) {
+    case AttentionVariant::kReference:
+      return "reference";
+    case AttentionVariant::kOptimizedV1:
+      return "v1";
+    case AttentionVariant::kOptimizedV2:
+      return "v2";
+    case AttentionVariant::kOptimizedV3:
+      return "v3";
+    case AttentionVariant::kOptimizedV4:
+      return "v4";
+    case AttentionVariant::kOptimizedV5:
+      return "v5";
+    case AttentionVariant::kOptimizedV7:
+      return "v7";
+    case AttentionVariant::kOptimizedV8:
+      return "v8";
+    case AttentionVariant::kOptimizedV9:
+      return "v9";
+    case AttentionVariant::kOptimizedV10:
+      return "v10";
+    case AttentionVariant::kOptimizedV11:
+      return "v11";
+    case AttentionVariant::kOptimizedV12:
+      return "v12";
+    case AttentionVariant::kOptimizedV13:
+      return "v13";
+    case AttentionVariant::kOptimizedV14:
+      return "v14";
+    case AttentionVariant::kOptimizedV15:
+      return "v15";
+  }
+  return "unknown";
+}
+
+bool split_profile_enabled() {
+  const char* value = std::getenv("DSV4_CUDA_REF_PROFILE_SPLIT");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
 
 __device__ __forceinline__ float fp8_e4m3fn_to_float(uint8_t bits) {
   const int sign = bits & 0x80;
@@ -2538,9 +2582,20 @@ torch::Tensor launch_ds4_cuda_attention(
           static_cast<unsigned int>(batch_size),
           static_cast<unsigned int>(head_tiles),
           static_cast<unsigned int>(row_tiles));
+      const auto stream = at::cuda::getCurrentCUDAStream();
+      const bool profile_split = split_profile_enabled();
+      cudaEvent_t partial_start = nullptr;
+      cudaEvent_t partial_stop = nullptr;
+      cudaEvent_t reduce_stop = nullptr;
+      if (profile_split) {
+        C10_CUDA_CHECK(cudaEventCreate(&partial_start));
+        C10_CUDA_CHECK(cudaEventCreate(&partial_stop));
+        C10_CUDA_CHECK(cudaEventCreate(&reduce_stop));
+        C10_CUDA_CHECK(cudaEventRecord(partial_start, stream));
+      }
       if (tensor_core_pv_rowgroup_accum) {
         ds4_cuda_fused_v8_mma_partial_kernel<true, 5, __nv_bfloat16>
-            <<<split_grid, split_block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            <<<split_grid, split_block, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
                 swa_k_cache.data_ptr<uint8_t>(),
                 swa_indices.data_ptr<int32_t>(),
@@ -2566,7 +2621,7 @@ torch::Tensor launch_ds4_cuda_attention(
                 reinterpret_cast<__nv_bfloat16*>(partial_acc.data_ptr<at::BFloat16>()));
       } else if (tensor_core_pv_specialized_v_decode) {
         ds4_cuda_fused_v8_mma_partial_kernel<true, 4, __nv_bfloat16>
-            <<<split_grid, split_block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            <<<split_grid, split_block, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
                 swa_k_cache.data_ptr<uint8_t>(),
                 swa_indices.data_ptr<int32_t>(),
@@ -2592,7 +2647,7 @@ torch::Tensor launch_ds4_cuda_attention(
                 reinterpret_cast<__nv_bfloat16*>(partial_acc.data_ptr<at::BFloat16>()));
       } else if (tensor_core_pv_cached_bf16_partial) {
         ds4_cuda_fused_v8_mma_partial_kernel<true, 3, __nv_bfloat16>
-            <<<split_grid, split_block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            <<<split_grid, split_block, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
                 swa_k_cache.data_ptr<uint8_t>(),
                 swa_indices.data_ptr<int32_t>(),
@@ -2618,7 +2673,7 @@ torch::Tensor launch_ds4_cuda_attention(
                 reinterpret_cast<__nv_bfloat16*>(partial_acc.data_ptr<at::BFloat16>()));
       } else if (tensor_core_pv_cached) {
         ds4_cuda_fused_v8_mma_partial_kernel<true, 3>
-            <<<split_grid, split_block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            <<<split_grid, split_block, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
                 swa_k_cache.data_ptr<uint8_t>(),
                 swa_indices.data_ptr<int32_t>(),
@@ -2644,7 +2699,7 @@ torch::Tensor launch_ds4_cuda_attention(
                 partial_acc.data_ptr<float>());
       } else if (tensor_core_pv_parallel) {
         ds4_cuda_fused_v8_mma_partial_kernel<true, 2>
-            <<<split_grid, split_block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            <<<split_grid, split_block, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
                 swa_k_cache.data_ptr<uint8_t>(),
                 swa_indices.data_ptr<int32_t>(),
@@ -2670,7 +2725,7 @@ torch::Tensor launch_ds4_cuda_attention(
                 partial_acc.data_ptr<float>());
       } else if (tensor_core_pv) {
         ds4_cuda_fused_v8_mma_partial_kernel<true, 1>
-            <<<split_grid, split_block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            <<<split_grid, split_block, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
                 swa_k_cache.data_ptr<uint8_t>(),
                 swa_indices.data_ptr<int32_t>(),
@@ -2696,7 +2751,7 @@ torch::Tensor launch_ds4_cuda_attention(
                 partial_acc.data_ptr<float>());
       } else if (cache_scales) {
         ds4_cuda_fused_v8_mma_partial_kernel<true, 0>
-            <<<split_grid, split_block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            <<<split_grid, split_block, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
                 swa_k_cache.data_ptr<uint8_t>(),
                 swa_indices.data_ptr<int32_t>(),
@@ -2722,7 +2777,7 @@ torch::Tensor launch_ds4_cuda_attention(
                 partial_acc.data_ptr<float>());
       } else {
         ds4_cuda_fused_v8_mma_partial_kernel<false, 0>
-            <<<split_grid, split_block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            <<<split_grid, split_block, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
                 swa_k_cache.data_ptr<uint8_t>(),
                 swa_indices.data_ptr<int32_t>(),
@@ -2747,12 +2802,15 @@ torch::Tensor launch_ds4_cuda_attention(
                 partial_sum.data_ptr<float>(),
                 partial_acc.data_ptr<float>());
       }
+      if (profile_split) {
+        C10_CUDA_CHECK(cudaEventRecord(partial_stop, stream));
+      }
       C10_CUDA_KERNEL_LAUNCH_CHECK();
       if (tensor_core_pv_cached_bf16_partial ||
           tensor_core_pv_specialized_v_decode ||
           tensor_core_pv_rowgroup_accum) {
         ds4_cuda_fused_v8_reduce_kernel<__nv_bfloat16>
-            <<<fused_grid, split_block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            <<<fused_grid, split_block, 0, stream>>>(
                 partial_max.data_ptr<float>(),
                 partial_sum.data_ptr<float>(),
                 reinterpret_cast<const __nv_bfloat16*>(partial_acc.data_ptr<at::BFloat16>()),
@@ -2765,7 +2823,7 @@ torch::Tensor launch_ds4_cuda_attention(
                 reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
       } else {
         ds4_cuda_fused_v8_reduce_kernel<float>
-            <<<fused_grid, split_block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            <<<fused_grid, split_block, 0, stream>>>(
                 partial_max.data_ptr<float>(),
                 partial_sum.data_ptr<float>(),
                 partial_acc.data_ptr<float>(),
@@ -2776,6 +2834,34 @@ torch::Tensor launch_ds4_cuda_attention(
                 static_cast<int>(head_tiles),
                 static_cast<int>(row_tiles),
                 reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
+      }
+      if (profile_split) {
+        C10_CUDA_CHECK(cudaEventRecord(reduce_stop, stream));
+        C10_CUDA_CHECK(cudaEventSynchronize(reduce_stop));
+        float partial_ms = 0.0f;
+        float reduce_ms = 0.0f;
+        C10_CUDA_CHECK(cudaEventElapsedTime(&partial_ms, partial_start, partial_stop));
+        C10_CUDA_CHECK(cudaEventElapsedTime(&reduce_ms, partial_stop, reduce_stop));
+        const char* partial_acc_dtype_name =
+            partial_acc_dtype == torch::kBFloat16 ? "bf16" : "fp32";
+        std::fprintf(
+            stderr,
+            "DSV4_CUDA_SPLIT_PROFILE variant=%s batch=%lld heads=%lld total_width=%lld "
+            "head_tiles=%lld row_tiles=%lld partial_acc_dtype=%s partial_ms=%.6f "
+            "reduce_ms=%.6f kernel_ms=%.6f\n",
+            attention_variant_name(variant),
+            static_cast<long long>(batch_size),
+            static_cast<long long>(num_heads),
+            static_cast<long long>(total_width),
+            static_cast<long long>(head_tiles),
+            static_cast<long long>(row_tiles),
+            partial_acc_dtype_name,
+            partial_ms,
+            reduce_ms,
+            partial_ms + reduce_ms);
+        C10_CUDA_CHECK(cudaEventDestroy(partial_start));
+        C10_CUDA_CHECK(cudaEventDestroy(partial_stop));
+        C10_CUDA_CHECK(cudaEventDestroy(reduce_stop));
       }
       break;
     }
