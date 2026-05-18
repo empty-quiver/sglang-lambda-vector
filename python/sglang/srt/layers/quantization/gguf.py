@@ -172,6 +172,7 @@ MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
 
 _GGUF_TRACE_COUNT = 0
+_GGUF_MOE_CAPTURE_COUNT = 0
 
 
 def _gguf_env_enabled(name: str) -> bool:
@@ -236,6 +237,95 @@ def _gguf_trace_elapsed_ms(start: Optional[float]) -> str:
         return "n/a"
     _gguf_trace_sync()
     return f"{(time.perf_counter() - start) * 1000.0:.3f}"
+
+
+def _gguf_moe_capture_enabled(debug_layer: Optional[int]) -> bool:
+    if _is_cuda and torch.cuda.is_current_stream_capturing():
+        return False
+    capture_dir = os.getenv("SGLANG_GGUF_MOE_CAPTURE_DIR")
+    if not capture_dir:
+        return False
+    target = os.getenv("SGLANG_GGUF_MOE_CAPTURE_LAYER")
+    if target is None:
+        return False
+    return target == "all" or (
+        debug_layer is not None and str(debug_layer) == target
+    )
+
+
+def _gguf_moe_capture_limit_reached() -> bool:
+    limit = int(os.getenv("SGLANG_GGUF_MOE_CAPTURE_LIMIT", "1"))
+    return limit >= 0 and _GGUF_MOE_CAPTURE_COUNT >= limit
+
+
+def _gguf_maybe_capture_active_moe(
+    *,
+    debug_layer: Optional[int],
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    active_mask: torch.Tensor,
+    active_token_ids: torch.Tensor,
+    active_topk_ids: torch.Tensor,
+    active_weights: torch.Tensor,
+    active_x: torch.Tensor,
+    active_out: torch.Tensor,
+    out_hidden_states: torch.Tensor,
+    qweight_type: int,
+    qweight_type2: int,
+    activation: str,
+):
+    global _GGUF_MOE_CAPTURE_COUNT
+
+    if not _gguf_moe_capture_enabled(debug_layer) or _gguf_moe_capture_limit_reached():
+        return
+
+    capture_dir = os.getenv("SGLANG_GGUF_MOE_CAPTURE_DIR")
+    assert capture_dir is not None
+    os.makedirs(capture_dir, exist_ok=True)
+
+    _GGUF_MOE_CAPTURE_COUNT += 1
+    capture_path = os.path.join(
+        capture_dir,
+        (
+            f"gguf_moe_layer{debug_layer}_capture{_GGUF_MOE_CAPTURE_COUNT}_"
+            f"tokens{x.shape[0]}_active{active_topk_ids.shape[0]}.pt"
+        ),
+    )
+
+    payload = {
+        "debug_layer": debug_layer,
+        "activation": activation,
+        "qweight_type": _gguf_quant_type_to_int(qweight_type),
+        "qweight_type2": _gguf_quant_type_to_int(qweight_type2),
+        "qweight_type_name": _gguf_quant_type_name(qweight_type),
+        "qweight_type2_name": _gguf_quant_type_name(qweight_type2),
+        "x": x.detach().cpu(),
+        "topk_weights": topk_weights.detach().cpu(),
+        "topk_ids": topk_ids.detach().cpu(),
+        "active_mask": active_mask.detach().cpu(),
+        "active_token_ids": active_token_ids.detach().cpu(),
+        "active_topk_ids": active_topk_ids.detach().cpu(),
+        "active_weights": active_weights.detach().cpu(),
+        "active_x": active_x.detach().cpu(),
+        "active_out": active_out.detach().cpu(),
+        "out_hidden_states": out_hidden_states.detach().cpu(),
+        "x_shape": tuple(x.shape),
+        "w1_shape": tuple(w1.shape),
+        "w2_shape": tuple(w2.shape),
+        "w1_stride": tuple(w1.stride()),
+        "w2_stride": tuple(w2.stride()),
+        "w1_dtype": str(w1.dtype),
+        "w2_dtype": str(w2.dtype),
+    }
+    if _gguf_env_enabled("SGLANG_GGUF_MOE_CAPTURE_WEIGHTS"):
+        payload["w1"] = w1.detach().cpu()
+        payload["w2"] = w2.detach().cpu()
+
+    torch.save(payload, capture_path)
+    print(f"[GGUF_MOE_CAPTURE saved] {capture_path}", flush=True)
 
 
 def fused_mul_mat_gguf(
@@ -372,6 +462,24 @@ def fused_moe_gguf(
             debug_layer=debug_layer,
         )
         out_hidden_states.index_add_(0, active_token_ids, active_out)
+        _gguf_maybe_capture_active_moe(
+            debug_layer=debug_layer,
+            x=x,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            active_mask=active_mask,
+            active_token_ids=active_token_ids,
+            active_topk_ids=active_topk_ids,
+            active_weights=active_weights,
+            active_x=active_x,
+            active_out=active_out,
+            out_hidden_states=out_hidden_states,
+            qweight_type=qweight_type,
+            qweight_type2=qweight_type2,
+            activation=activation,
+        )
         trace_done(
             "active_filter",
             f"active_tokens={active_tokens} original_tokens={num_tokens}",
