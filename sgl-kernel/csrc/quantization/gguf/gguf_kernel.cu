@@ -587,7 +587,7 @@ torch::Tensor ggml_moe_a8_vec(
   const int padded = (col + 512 - 1) / 512 * 512;
   const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
   auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
-  at::Tensor Y = torch::zeros({tokens * top_k, row}, options);
+  at::Tensor Y = torch::empty({tokens * top_k, row}, options);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
   options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
   at::Tensor quant_X = torch::empty({tokens, padded / 32 * 9}, options);
@@ -841,6 +841,8 @@ torch::Tensor ggml_moe_a8_vec(
             quant_X.stride(0),
             stream);
         break;
+      default:
+        TORCH_CHECK(false, "unsupported GGUF MoE vec quant type: ", type);
     }
   });
   return Y;
