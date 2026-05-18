@@ -29,7 +29,7 @@ def _load_extension():
     os.environ.setdefault("MAX_JOBS", str(os.cpu_count() or 4))
 
     return load(
-        name="ds4_cuda_reference_attention_debug_ext",
+        name="ds4_cuda_reference_attention_opt_ext",
         sources=[
             str(_HERE / "ds4_cuda_reference_attention.cpp"),
             str(_HERE / "ds4_cuda_reference_attention.cu"),
@@ -69,6 +69,7 @@ def ds4_cuda_sparse_attention(
     extra_indices: torch.Tensor | None = None,
     extra_topk_lengths: torch.Tensor | None = None,
     extra_page_size: int | None = None,
+    optimized: bool = False,
 ) -> torch.Tensor:
     """Run the debug CUDA DS4 sparse attention kernel."""
     ext = _load_extension()
@@ -82,7 +83,12 @@ def ds4_cuda_sparse_attention(
     )
 
     has_extra = extra_k_cache is not None
-    return ext.ds4_cuda_reference_attention(
+    op = (
+        ext.ds4_cuda_optimized_attention
+        if optimized
+        else ext.ds4_cuda_reference_attention
+    )
+    return op(
         q_cuda,
         _cuda_u8(swa_k_cache, device),
         _cuda_i32(swa_indices, device),
@@ -97,7 +103,11 @@ def ds4_cuda_sparse_attention(
     )
 
 
-def ds4_cuda_sparse_attention_from_fixture(fixture: dict[str, Any]) -> torch.Tensor:
+def ds4_cuda_sparse_attention_from_fixture(
+    fixture: dict[str, Any],
+    *,
+    optimized: bool = False,
+) -> torch.Tensor:
     """Run the CUDA kernel using a fixture emitted by the SGLang DS4 hook."""
     if str(fixture.get("layout", "dsv4_packed")) != "dsv4_packed":
         raise ValueError("CUDA debug kernel only supports dsv4_packed fixtures")
@@ -118,4 +128,5 @@ def ds4_cuda_sparse_attention_from_fixture(fixture: dict[str, Any]) -> torch.Ten
             if fixture.get("extra_page_size") is not None
             else None
         ),
+        optimized=optimized,
     )

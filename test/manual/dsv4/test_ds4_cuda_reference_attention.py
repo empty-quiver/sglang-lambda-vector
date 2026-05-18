@@ -66,17 +66,18 @@ def _benchmark_cuda_fixture(
     *,
     warmup: int,
     iters: int,
+    optimized: bool,
 ) -> float:
     gpu_fixture = _fixture_to_cuda(fixture)
     for _ in range(warmup):
-        ds4_cuda_sparse_attention_from_fixture(gpu_fixture)
+        ds4_cuda_sparse_attention_from_fixture(gpu_fixture, optimized=optimized)
     torch.cuda.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(iters):
-        ds4_cuda_sparse_attention_from_fixture(gpu_fixture)
+        ds4_cuda_sparse_attention_from_fixture(gpu_fixture, optimized=optimized)
     end.record()
     torch.cuda.synchronize()
     return float(start.elapsed_time(end)) / max(iters, 1)
@@ -113,11 +114,25 @@ class TestDS4CudaReferenceAttention(unittest.TestCase):
         rtol: float,
         check_expected: bool,
     ):
-        actual = ds4_cuda_sparse_attention_from_fixture(fixture).cpu()
+        reference = ds4_cuda_sparse_attention_from_fixture(
+            fixture,
+            optimized=False,
+        ).cpu()
+        actual = ds4_cuda_sparse_attention_from_fixture(
+            fixture,
+            optimized=True,
+        ).cpu()
         oracle = _torch_oracle(fixture)
         results = [
             compare_tensors(
-                f"cuda_vs_oracle:{name}",
+                f"optimized_vs_reference:{name}",
+                actual,
+                reference,
+                atol=atol,
+                rtol=rtol,
+            ),
+            compare_tensors(
+                f"optimized_vs_oracle:{name}",
                 actual,
                 oracle,
                 atol=atol,
@@ -127,7 +142,7 @@ class TestDS4CudaReferenceAttention(unittest.TestCase):
         if check_expected and "expected" in fixture:
             results.append(
                 compare_tensors(
-                    f"cuda_vs_expected:{name}",
+                    f"optimized_vs_expected:{name}",
                     actual,
                     fixture["expected"],
                     atol=atol,
@@ -178,8 +193,22 @@ class TestDS4CudaReferenceAttention(unittest.TestCase):
                     fixture,
                     warmup=bench_warmup,
                     iters=bench_iters,
+                    optimized=False,
                 )
-                print(f"BENCH cuda_kernel:{spec.name}: avg_ms={avg_ms:.6g}")
+                opt_ms = _benchmark_cuda_fixture(
+                    fixture,
+                    warmup=bench_warmup,
+                    iters=bench_iters,
+                    optimized=True,
+                )
+                speedup = avg_ms / opt_ms if opt_ms else float("inf")
+                print(
+                    f"BENCH cuda_reference:{spec.name}: avg_ms={avg_ms:.6g}"
+                )
+                print(
+                    f"BENCH cuda_optimized:{spec.name}: avg_ms={opt_ms:.6g} "
+                    f"speedup={speedup:.3f}x"
+                )
 
         self.assertFalse(
             failures,
