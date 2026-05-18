@@ -79,7 +79,9 @@ constexpr int kPartialProfileQkScoreStoreWall = 10;
 constexpr int kPartialProfileQkBlockBarrier = 11;
 constexpr int kPartialProfileQkThreadQLoad = 12;
 constexpr int kPartialProfileQkThreadKDecode = 13;
-constexpr int kPartialProfileSlots = 14;
+constexpr int kPartialProfileQkStagingNopeWall = 14;
+constexpr int kPartialProfileQkStagingRopeWall = 15;
+constexpr int kPartialProfileSlots = 16;
 
 enum class AttentionVariant : int {
   kReference = 0,
@@ -2315,8 +2317,14 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
       __syncwarp();
       if (profile_this_block && threadIdx.x == 0) {
         const unsigned long long now = clock64();
+        const unsigned long long staging_cycles = now - qk_detail_t0;
         add_partial_profile_cycles(
-            profile_cycles, kPartialProfileQkStagingWall, now - qk_detail_t0);
+            profile_cycles, kPartialProfileQkStagingWall, staging_cycles);
+        add_partial_profile_cycles(
+            profile_cycles,
+            dim_base < kNopeDim ? kPartialProfileQkStagingNopeWall
+                                : kPartialProfileQkStagingRopeWall,
+            staging_cycles);
         qk_detail_t0 = now;
       }
 
@@ -4846,9 +4854,11 @@ torch::Tensor launch_ds4_cuda_attention(
             "partial_store_pct=%.2f qk_staging_wall_cycles=%lld "
             "qk_mma_wall_cycles=%lld qk_score_store_wall_cycles=%lld "
             "qk_block_barrier_cycles=%lld qk_thread_q_load_cycles=%lld "
-            "qk_thread_k_decode_cycles=%lld qk_staging_wall_pct_of_qk=%.2f "
+            "qk_thread_k_decode_cycles=%lld qk_staging_nope_wall_cycles=%lld "
+            "qk_staging_rope_wall_cycles=%lld qk_staging_wall_pct_of_qk=%.2f "
             "qk_mma_wall_pct_of_qk=%.2f qk_score_store_wall_pct_of_qk=%.2f "
-            "qk_block_barrier_pct_of_qk=%.2f\n",
+            "qk_block_barrier_pct_of_qk=%.2f qk_staging_nope_pct_of_staging=%.2f "
+            "qk_staging_rope_pct_of_staging=%.2f\n",
             attention_variant_name(variant),
             static_cast<long long>(batch_size),
             static_cast<long long>(num_heads),
@@ -4876,10 +4886,20 @@ torch::Tensor launch_ds4_cuda_attention(
             static_cast<long long>(profile_values[kPartialProfileQkBlockBarrier]),
             static_cast<long long>(profile_values[kPartialProfileQkThreadQLoad]),
             static_cast<long long>(profile_values[kPartialProfileQkThreadKDecode]),
+            static_cast<long long>(profile_values[kPartialProfileQkStagingNopeWall]),
+            static_cast<long long>(profile_values[kPartialProfileQkStagingRopeWall]),
             static_cast<double>(profile_values[kPartialProfileQkStagingWall]) * inv_qk,
             static_cast<double>(profile_values[kPartialProfileQkMmaWall]) * inv_qk,
             static_cast<double>(profile_values[kPartialProfileQkScoreStoreWall]) * inv_qk,
-            static_cast<double>(profile_values[kPartialProfileQkBlockBarrier]) * inv_qk);
+            static_cast<double>(profile_values[kPartialProfileQkBlockBarrier]) * inv_qk,
+            static_cast<double>(profile_values[kPartialProfileQkStagingNopeWall]) *
+                (profile_values[kPartialProfileQkStagingWall] > 0
+                     ? 100.0 / static_cast<double>(profile_values[kPartialProfileQkStagingWall])
+                     : 0.0),
+            static_cast<double>(profile_values[kPartialProfileQkStagingRopeWall]) *
+                (profile_values[kPartialProfileQkStagingWall] > 0
+                     ? 100.0 / static_cast<double>(profile_values[kPartialProfileQkStagingWall])
+                     : 0.0));
       }
       if (profile_split) {
         if (!profile_partial_stages) {
