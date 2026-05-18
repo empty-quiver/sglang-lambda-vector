@@ -8,7 +8,8 @@ Run from the repository root:
 The C++ extension emits one DSV4_CUDA_SPLIT_PROFILE line per profiled sample
 when DSV4_CUDA_REF_PROFILE_SPLIT is enabled. Set
 DSV4_CUDA_PROFILE_PARTIAL_STAGES=1 to also emit the v15 partial-kernel stage
-cycle counters. This script enables profiling flags only for a small number of
+cycle counters, including the QK sub-stage counters used to decide the next
+kernel rung. This script enables profiling flags only for a small number of
 samples, then disables them for the normal total-time benchmark.
 """
 
