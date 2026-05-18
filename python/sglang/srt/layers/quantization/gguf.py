@@ -184,12 +184,12 @@ def _gguf_trace_layer_enabled(debug_layer: Optional[int]) -> bool:
     return target is None or debug_layer is None or str(debug_layer) == target
 
 
-def _gguf_trace_enabled(debug_layer: Optional[int] = None) -> bool:
+def _gguf_trace_enabled(
+    name: str = "SGLANG_GGUF_MOE_TRACE", debug_layer: Optional[int] = None
+) -> bool:
     if _is_cuda and torch.cuda.is_current_stream_capturing():
         return False
-    return _gguf_env_enabled("SGLANG_GGUF_MOE_TRACE") and _gguf_trace_layer_enabled(
-        debug_layer
-    )
+    return _gguf_env_enabled(name) and _gguf_trace_layer_enabled(debug_layer)
 
 
 def _gguf_trace_sync():
@@ -241,7 +241,7 @@ def _gguf_trace_elapsed_ms(start: Optional[float]) -> str:
 def fused_mul_mat_gguf(
     x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
 ) -> torch.Tensor:
-    trace_enabled = _gguf_trace_enabled()
+    trace_enabled = _gguf_trace_enabled("SGLANG_GGUF_MATMUL_TRACE")
     trace_start = _gguf_trace_start(trace_enabled)
     branch = "unknown"
     if qweight_type in IMATRIX_QUANT_TYPES:
@@ -315,7 +315,7 @@ def fused_moe_gguf(
             return gelu_and_mul(x)
         raise ValueError(f"Unsupported activation: {activation}")
 
-    trace_enabled = _gguf_trace_enabled(debug_layer)
+    trace_enabled = _gguf_trace_enabled("SGLANG_GGUF_MOE_TRACE", debug_layer)
     trace_start = _gguf_trace_start(trace_enabled)
 
     def trace_done(branch: str, extra: str = ""):
