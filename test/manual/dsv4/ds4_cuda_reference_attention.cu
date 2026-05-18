@@ -16,6 +16,18 @@ constexpr int kScaleGroup = 64;
 constexpr int kScaleOffset = kNopeDim + kRopeDim * 2;
 constexpr int kPackedBytes = kScaleOffset + kNopeDim / kScaleGroup;
 constexpr int kThreads = 256;
+constexpr int kWarps = kThreads / 32;
+constexpr int kScaleCount = kNopeDim / kScaleGroup;
+constexpr int kScaleCacheOffset = kWarps;
+constexpr int kOptimizedV2SharedFloats = kWarps;
+constexpr int kOptimizedV3SharedFloats = kScaleCacheOffset + kScaleCount;
+
+enum class AttentionVariant : int {
+  kReference = 0,
+  kOptimizedV1 = 1,
+  kOptimizedV2 = 2,
+  kOptimizedV3 = 3,
+};
 
 __device__ __forceinline__ float fp8_e4m3fn_to_float(uint8_t bits) {
   const int sign = bits & 0x80;
@@ -46,6 +58,19 @@ __device__ __forceinline__ float load_dsv4_packed_dim(
     const int group = dim / kScaleGroup;
     const float scale = exp2f(static_cast<float>(packed[kScaleOffset + group]) - 127.0f);
     return q * scale;
+  }
+
+  const int rope_dim = dim - kNopeDim;
+  return bf16_bytes_to_float(packed + kNopeDim + rope_dim * 2);
+}
+
+__device__ __forceinline__ float load_dsv4_packed_dim_with_scales(
+    const uint8_t* packed,
+    int dim,
+    const float* scales) {
+  if (dim < kNopeDim) {
+    const float q = fp8_e4m3fn_to_float(packed[dim]);
+    return q * scales[dim / kScaleGroup];
   }
 
   const int rope_dim = dim - kNopeDim;
@@ -83,7 +108,7 @@ __device__ __forceinline__ void reduce_sum_warp_block(float* shared, float& valu
   }
   __syncthreads();
 
-  value = threadIdx.x < (kThreads / 32) ? shared[lane] : 0.0f;
+  value = threadIdx.x < kWarps ? shared[lane] : 0.0f;
   if (warp == 0) {
     value = warp_reduce_sum(value);
   }
@@ -93,6 +118,39 @@ __device__ __forceinline__ void reduce_sum_warp_block(float* shared, float& valu
   __syncthreads();
   value = shared[0];
   __syncthreads();
+}
+
+__device__ __forceinline__ void cache_row_scales(
+    const uint8_t* packed,
+    float* shared) {
+  if (threadIdx.x < kScaleCount) {
+    shared[kScaleCacheOffset + threadIdx.x] =
+        exp2f(static_cast<float>(packed[kScaleOffset + threadIdx.x]) - 127.0f);
+  }
+  __syncthreads();
+}
+
+__device__ __forceinline__ void warp_broadcast_softmax_update(
+    float score,
+    float& running_max,
+    float& running_sum,
+    float& old_scale,
+    float& row_scale) {
+  const int lane = threadIdx.x & 31;
+  float new_max = running_max;
+  float new_sum = running_sum;
+  if (lane == 0) {
+    new_max = fmaxf(running_max, score);
+    old_scale = running_sum == 0.0f ? 0.0f : expf(running_max - new_max);
+    row_scale = expf(score - new_max);
+    new_sum = running_sum * old_scale + row_scale;
+  }
+  new_max = __shfl_sync(0xffffffff, new_max, 0);
+  new_sum = __shfl_sync(0xffffffff, new_sum, 0);
+  old_scale = __shfl_sync(0xffffffff, old_scale, 0);
+  row_scale = __shfl_sync(0xffffffff, row_scale, 0);
+  running_max = new_max;
+  running_sum = new_sum;
 }
 
 __device__ __forceinline__ const uint8_t* selected_row_ptr(
@@ -107,8 +165,16 @@ __device__ __forceinline__ const uint8_t* selected_row_ptr(
   if (index < 0) {
     index = 0;
   }
-  const int page = index / page_size;
-  const int token = index - page * page_size;
+  int page;
+  int token;
+  if (page_size > 0 && (page_size & (page_size - 1)) == 0) {
+    const int shift = __ffs(page_size) - 1;
+    page = index >> shift;
+    token = index & (page_size - 1);
+  } else {
+    page = index / page_size;
+    token = index - page * page_size;
+  }
   return cache + (static_cast<int64_t>(page) * page_size + token) * row_stride;
 }
 
@@ -183,6 +249,100 @@ __device__ __forceinline__ void consume_row_optimized(
   }
   if (dim1 < kHeadDim) {
     acc1 = acc1 * old_scale + row_scale * v1;
+  }
+}
+
+__device__ __forceinline__ void consume_row_optimized_v2(
+    const uint8_t* packed,
+    float softmax_scale,
+    float& running_max,
+    float& running_sum,
+    float& acc0,
+    float& acc1,
+    float q0,
+    float q1,
+    int dim0,
+    int dim1,
+    float* shared) {
+  float dot_part = 0.0f;
+  const float v0 = dim0 < kHeadDim ? load_dsv4_packed_dim(packed, dim0) : 0.0f;
+  const float v1 = dim1 < kHeadDim ? load_dsv4_packed_dim(packed, dim1) : 0.0f;
+  if (dim0 < kHeadDim) {
+    dot_part += q0 * v0;
+  }
+  if (dim1 < kHeadDim) {
+    dot_part += q1 * v1;
+  }
+
+  reduce_sum_warp_block(shared, dot_part);
+  float old_scale = 0.0f;
+  float row_scale = 0.0f;
+  warp_broadcast_softmax_update(
+      dot_part * softmax_scale, running_max, running_sum, old_scale, row_scale);
+  if (dim0 < kHeadDim) {
+    acc0 = acc0 * old_scale + row_scale * v0;
+  }
+  if (dim1 < kHeadDim) {
+    acc1 = acc1 * old_scale + row_scale * v1;
+  }
+}
+
+__device__ __forceinline__ void consume_row_optimized_v3(
+    const uint8_t* packed,
+    float softmax_scale,
+    float& running_max,
+    float& running_sum,
+    float& acc0,
+    float& acc1,
+    float q0,
+    float q1,
+    int dim0,
+    int dim1,
+    float* shared) {
+  cache_row_scales(packed, shared);
+  const float* scales = shared + kScaleCacheOffset;
+
+  float dot_part = 0.0f;
+  const float v0 =
+      dim0 < kHeadDim ? load_dsv4_packed_dim_with_scales(packed, dim0, scales) : 0.0f;
+  const float v1 =
+      dim1 < kHeadDim ? load_dsv4_packed_dim_with_scales(packed, dim1, scales) : 0.0f;
+  if (dim0 < kHeadDim) {
+    dot_part += q0 * v0;
+  }
+  if (dim1 < kHeadDim) {
+    dot_part += q1 * v1;
+  }
+
+  reduce_sum_warp_block(shared, dot_part);
+  float old_scale = 0.0f;
+  float row_scale = 0.0f;
+  warp_broadcast_softmax_update(
+      dot_part * softmax_scale, running_max, running_sum, old_scale, row_scale);
+  if (dim0 < kHeadDim) {
+    acc0 = acc0 * old_scale + row_scale * v0;
+  }
+  if (dim1 < kHeadDim) {
+    acc1 = acc1 * old_scale + row_scale * v1;
+  }
+}
+
+__device__ __forceinline__ void consume_sink_broadcast(
+    float sink,
+    float& running_max,
+    float& running_sum,
+    float& acc0,
+    float& acc1,
+    int dim0,
+    int dim1) {
+  float old_scale = 0.0f;
+  float sink_scale = 0.0f;
+  warp_broadcast_softmax_update(sink, running_max, running_sum, old_scale, sink_scale);
+  if (dim0 < kHeadDim) {
+    acc0 *= old_scale;
+  }
+  if (dim1 < kHeadDim) {
+    acc1 *= old_scale;
   }
 }
 
@@ -335,7 +495,7 @@ __global__ void ds4_cuda_optimized_attention_kernel(
     return;
   }
 
-  __shared__ float shared[kThreads / 32];
+  __shared__ float shared[kWarps];
 
   const int tid = threadIdx.x;
   const int dim0 = tid;
@@ -430,6 +590,149 @@ __global__ void ds4_cuda_optimized_attention_kernel(
   }
 }
 
+template <bool CacheScales>
+__global__ void ds4_cuda_optimized_v2_attention_kernel(
+    const __nv_bfloat16* __restrict__ q,
+    const uint8_t* __restrict__ swa_cache,
+    const int32_t* __restrict__ swa_indices,
+    const int32_t* __restrict__ swa_lengths,
+    int swa_width,
+    int swa_page_size,
+    int swa_row_stride,
+    const float* __restrict__ attn_sink,
+    bool has_sink,
+    const uint8_t* __restrict__ extra_cache,
+    const int32_t* __restrict__ extra_indices,
+    const int32_t* __restrict__ extra_lengths,
+    int extra_width,
+    int extra_page_size,
+    int extra_row_stride,
+    bool has_extra,
+    float softmax_scale,
+    int batch_size,
+    int num_heads,
+    __nv_bfloat16* __restrict__ out) {
+  const int batch = blockIdx.x;
+  const int head = blockIdx.y;
+  if (batch >= batch_size || head >= num_heads) {
+    return;
+  }
+
+  __shared__ float shared[CacheScales ? kOptimizedV3SharedFloats : kOptimizedV2SharedFloats];
+
+  const int tid = threadIdx.x;
+  const int dim0 = tid;
+  const int dim1 = tid + kThreads;
+  const int64_t q_base = (static_cast<int64_t>(batch) * num_heads + head) * kHeadDim;
+
+  const float q0 = dim0 < kHeadDim ? __bfloat162float(q[q_base + dim0]) : 0.0f;
+  const float q1 = dim1 < kHeadDim ? __bfloat162float(q[q_base + dim1]) : 0.0f;
+
+  float running_max = -INFINITY;
+  float running_sum = 0.0f;
+  float acc0 = 0.0f;
+  float acc1 = 0.0f;
+
+  int swa_len = swa_lengths[batch];
+  if (swa_len < 0) {
+    swa_len = 0;
+  }
+  if (swa_len > swa_width) {
+    swa_len = swa_width;
+  }
+  for (int row = 0; row < swa_len; ++row) {
+    const uint8_t* packed = selected_row_ptr(
+        swa_cache, swa_indices, swa_width, swa_page_size, swa_row_stride, batch, row);
+    if constexpr (CacheScales) {
+      consume_row_optimized_v3(
+          packed,
+          softmax_scale,
+          running_max,
+          running_sum,
+          acc0,
+          acc1,
+          q0,
+          q1,
+          dim0,
+          dim1,
+          shared);
+    } else {
+      consume_row_optimized_v2(
+          packed,
+          softmax_scale,
+          running_max,
+          running_sum,
+          acc0,
+          acc1,
+          q0,
+          q1,
+          dim0,
+          dim1,
+          shared);
+    }
+  }
+
+  if (has_extra) {
+    int extra_len = extra_lengths[batch];
+    if (extra_len < 0) {
+      extra_len = 0;
+    }
+    if (extra_len > extra_width) {
+      extra_len = extra_width;
+    }
+    for (int row = 0; row < extra_len; ++row) {
+      const uint8_t* packed = selected_row_ptr(
+          extra_cache,
+          extra_indices,
+          extra_width,
+          extra_page_size,
+          extra_row_stride,
+          batch,
+          row);
+      if constexpr (CacheScales) {
+        consume_row_optimized_v3(
+            packed,
+            softmax_scale,
+            running_max,
+            running_sum,
+            acc0,
+            acc1,
+            q0,
+            q1,
+            dim0,
+            dim1,
+            shared);
+      } else {
+        consume_row_optimized_v2(
+            packed,
+            softmax_scale,
+            running_max,
+            running_sum,
+            acc0,
+            acc1,
+            q0,
+            q1,
+            dim0,
+            dim1,
+            shared);
+      }
+    }
+  }
+
+  if (has_sink) {
+    consume_sink_broadcast(
+        attn_sink[head], running_max, running_sum, acc0, acc1, dim0, dim1);
+  }
+
+  const float inv_sum = running_sum > 0.0f ? 1.0f / running_sum : 0.0f;
+  if (dim0 < kHeadDim) {
+    out[q_base + dim0] = __float2bfloat16(acc0 * inv_sum);
+  }
+  if (dim1 < kHeadDim) {
+    out[q_base + dim1] = __float2bfloat16(acc1 * inv_sum);
+  }
+}
+
 int64_t flattened_batch(torch::Tensor q) {
   TORCH_CHECK(q.dim() >= 3, "q must have shape [..., heads, 512], got ", q.sizes());
   TORCH_CHECK(q.size(-1) == kHeadDim, "q head dim must be 512, got ", q.size(-1));
@@ -452,7 +755,7 @@ torch::Tensor launch_ds4_cuda_attention(
     torch::Tensor extra_indices,
     torch::Tensor extra_topk_lengths,
     int64_t extra_page_size,
-    bool optimized) {
+    AttentionVariant variant) {
   TORCH_CHECK(q.is_cuda(), "q must be CUDA");
   TORCH_CHECK(q.scalar_type() == torch::kBFloat16, "q must be bfloat16");
   TORCH_CHECK(swa_k_cache.is_cuda(), "swa_k_cache must be CUDA");
@@ -511,8 +814,32 @@ torch::Tensor launch_ds4_cuda_attention(
 
   dim3 grid(batch_size, num_heads);
   dim3 block(kThreads);
-  if (optimized) {
-    ds4_cuda_optimized_attention_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+  switch (variant) {
+    case AttentionVariant::kReference:
+      ds4_cuda_reference_attention_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+          reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
+          swa_k_cache.data_ptr<uint8_t>(),
+          swa_indices.data_ptr<int32_t>(),
+          swa_topk_lengths.data_ptr<int32_t>(),
+          static_cast<int>(swa_width),
+          static_cast<int>(swa_page_size),
+          static_cast<int>(swa_k_cache.size(3)),
+          has_sink ? attn_sink.data_ptr<float>() : nullptr,
+          has_sink,
+          has_extra ? extra_k_cache.data_ptr<uint8_t>() : nullptr,
+          has_extra ? extra_indices.data_ptr<int32_t>() : nullptr,
+          has_extra ? extra_topk_lengths.data_ptr<int32_t>() : nullptr,
+          static_cast<int>(extra_width),
+          static_cast<int>(extra_page_size),
+          has_extra ? static_cast<int>(extra_k_cache.size(3)) : 0,
+          has_extra,
+          static_cast<float>(softmax_scale),
+          static_cast<int>(batch_size),
+          static_cast<int>(num_heads),
+          reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
+      break;
+    case AttentionVariant::kOptimizedV1:
+      ds4_cuda_optimized_attention_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
         swa_k_cache.data_ptr<uint8_t>(),
         swa_indices.data_ptr<int32_t>(),
@@ -533,28 +860,55 @@ torch::Tensor launch_ds4_cuda_attention(
         static_cast<int>(batch_size),
         static_cast<int>(num_heads),
         reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
-  } else {
-    ds4_cuda_reference_attention_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
-        swa_k_cache.data_ptr<uint8_t>(),
-        swa_indices.data_ptr<int32_t>(),
-        swa_topk_lengths.data_ptr<int32_t>(),
-        static_cast<int>(swa_width),
-        static_cast<int>(swa_page_size),
-        static_cast<int>(swa_k_cache.size(3)),
-        has_sink ? attn_sink.data_ptr<float>() : nullptr,
-        has_sink,
-        has_extra ? extra_k_cache.data_ptr<uint8_t>() : nullptr,
-        has_extra ? extra_indices.data_ptr<int32_t>() : nullptr,
-        has_extra ? extra_topk_lengths.data_ptr<int32_t>() : nullptr,
-        static_cast<int>(extra_width),
-        static_cast<int>(extra_page_size),
-        has_extra ? static_cast<int>(extra_k_cache.size(3)) : 0,
-        has_extra,
-        static_cast<float>(softmax_scale),
-        static_cast<int>(batch_size),
-        static_cast<int>(num_heads),
-        reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
+      break;
+    case AttentionVariant::kOptimizedV2:
+      ds4_cuda_optimized_v2_attention_kernel<false>
+          <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+              reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
+              swa_k_cache.data_ptr<uint8_t>(),
+              swa_indices.data_ptr<int32_t>(),
+              swa_topk_lengths.data_ptr<int32_t>(),
+              static_cast<int>(swa_width),
+              static_cast<int>(swa_page_size),
+              static_cast<int>(swa_k_cache.size(3)),
+              has_sink ? attn_sink.data_ptr<float>() : nullptr,
+              has_sink,
+              has_extra ? extra_k_cache.data_ptr<uint8_t>() : nullptr,
+              has_extra ? extra_indices.data_ptr<int32_t>() : nullptr,
+              has_extra ? extra_topk_lengths.data_ptr<int32_t>() : nullptr,
+              static_cast<int>(extra_width),
+              static_cast<int>(extra_page_size),
+              has_extra ? static_cast<int>(extra_k_cache.size(3)) : 0,
+              has_extra,
+              static_cast<float>(softmax_scale),
+              static_cast<int>(batch_size),
+              static_cast<int>(num_heads),
+              reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
+      break;
+    case AttentionVariant::kOptimizedV3:
+      ds4_cuda_optimized_v2_attention_kernel<true>
+          <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+              reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
+              swa_k_cache.data_ptr<uint8_t>(),
+              swa_indices.data_ptr<int32_t>(),
+              swa_topk_lengths.data_ptr<int32_t>(),
+              static_cast<int>(swa_width),
+              static_cast<int>(swa_page_size),
+              static_cast<int>(swa_k_cache.size(3)),
+              has_sink ? attn_sink.data_ptr<float>() : nullptr,
+              has_sink,
+              has_extra ? extra_k_cache.data_ptr<uint8_t>() : nullptr,
+              has_extra ? extra_indices.data_ptr<int32_t>() : nullptr,
+              has_extra ? extra_topk_lengths.data_ptr<int32_t>() : nullptr,
+              static_cast<int>(extra_width),
+              static_cast<int>(extra_page_size),
+              has_extra ? static_cast<int>(extra_k_cache.size(3)) : 0,
+              has_extra,
+              static_cast<float>(softmax_scale),
+              static_cast<int>(batch_size),
+              static_cast<int>(num_heads),
+              reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
+      break;
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
@@ -586,7 +940,7 @@ torch::Tensor ds4_cuda_reference_attention(
       extra_indices,
       extra_topk_lengths,
       extra_page_size,
-      false);
+      AttentionVariant::kReference);
 }
 
 torch::Tensor ds4_cuda_optimized_attention(
@@ -613,5 +967,59 @@ torch::Tensor ds4_cuda_optimized_attention(
       extra_indices,
       extra_topk_lengths,
       extra_page_size,
-      true);
+      AttentionVariant::kOptimizedV1);
+}
+
+torch::Tensor ds4_cuda_optimized_v2_attention(
+    torch::Tensor q,
+    torch::Tensor swa_k_cache,
+    torch::Tensor swa_indices,
+    torch::Tensor swa_topk_lengths,
+    int64_t swa_page_size,
+    double softmax_scale,
+    torch::Tensor attn_sink,
+    torch::Tensor extra_k_cache,
+    torch::Tensor extra_indices,
+    torch::Tensor extra_topk_lengths,
+    int64_t extra_page_size) {
+  return launch_ds4_cuda_attention(
+      q,
+      swa_k_cache,
+      swa_indices,
+      swa_topk_lengths,
+      swa_page_size,
+      softmax_scale,
+      attn_sink,
+      extra_k_cache,
+      extra_indices,
+      extra_topk_lengths,
+      extra_page_size,
+      AttentionVariant::kOptimizedV2);
+}
+
+torch::Tensor ds4_cuda_optimized_v3_attention(
+    torch::Tensor q,
+    torch::Tensor swa_k_cache,
+    torch::Tensor swa_indices,
+    torch::Tensor swa_topk_lengths,
+    int64_t swa_page_size,
+    double softmax_scale,
+    torch::Tensor attn_sink,
+    torch::Tensor extra_k_cache,
+    torch::Tensor extra_indices,
+    torch::Tensor extra_topk_lengths,
+    int64_t extra_page_size) {
+  return launch_ds4_cuda_attention(
+      q,
+      swa_k_cache,
+      swa_indices,
+      swa_topk_lengths,
+      swa_page_size,
+      softmax_scale,
+      attn_sink,
+      extra_k_cache,
+      extra_indices,
+      extra_topk_lengths,
+      extra_page_size,
+      AttentionVariant::kOptimizedV3);
 }

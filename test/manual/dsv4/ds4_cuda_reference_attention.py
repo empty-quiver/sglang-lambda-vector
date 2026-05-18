@@ -29,7 +29,7 @@ def _load_extension():
     os.environ.setdefault("MAX_JOBS", str(os.cpu_count() or 4))
 
     return load(
-        name="ds4_cuda_reference_attention_opt_ext",
+        name="ds4_cuda_reference_attention_opt_v3_ext",
         sources=[
             str(_HERE / "ds4_cuda_reference_attention.cpp"),
             str(_HERE / "ds4_cuda_reference_attention.cu"),
@@ -38,6 +38,18 @@ def _load_extension():
         extra_cuda_cflags=["-O2", "--use_fast_math", "-lineinfo"],
         verbose=bool(int(os.environ.get("DSV4_CUDA_REF_BUILD_VERBOSE", "0"))),
     )
+
+
+def _resolve_op(ext, optimized: bool | str | int):
+    if optimized is False or optimized == 0 or optimized == "reference":
+        return ext.ds4_cuda_reference_attention
+    if optimized is True or optimized == 1 or optimized in {"optimized", "v1"}:
+        return ext.ds4_cuda_optimized_attention
+    if optimized == 2 or optimized in {"v2", "softmax_broadcast"}:
+        return ext.ds4_cuda_optimized_v2_attention
+    if optimized == 3 or optimized in {"v3", "scale_cache"}:
+        return ext.ds4_cuda_optimized_v3_attention
+    raise ValueError(f"unknown DS4 CUDA attention variant: {optimized!r}")
 
 
 def _empty_cuda_tensor(device: torch.device) -> torch.Tensor:
@@ -69,7 +81,7 @@ def ds4_cuda_sparse_attention(
     extra_indices: torch.Tensor | None = None,
     extra_topk_lengths: torch.Tensor | None = None,
     extra_page_size: int | None = None,
-    optimized: bool = False,
+    optimized: bool | str | int = False,
 ) -> torch.Tensor:
     """Run the debug CUDA DS4 sparse attention kernel."""
     ext = _load_extension()
@@ -83,11 +95,7 @@ def ds4_cuda_sparse_attention(
     )
 
     has_extra = extra_k_cache is not None
-    op = (
-        ext.ds4_cuda_optimized_attention
-        if optimized
-        else ext.ds4_cuda_reference_attention
-    )
+    op = _resolve_op(ext, optimized)
     return op(
         q_cuda,
         _cuda_u8(swa_k_cache, device),
@@ -106,7 +114,7 @@ def ds4_cuda_sparse_attention(
 def ds4_cuda_sparse_attention_from_fixture(
     fixture: dict[str, Any],
     *,
-    optimized: bool = False,
+    optimized: bool | str | int = False,
 ) -> torch.Tensor:
     """Run the CUDA kernel using a fixture emitted by the SGLang DS4 hook."""
     if str(fixture.get("layout", "dsv4_packed")) != "dsv4_packed":

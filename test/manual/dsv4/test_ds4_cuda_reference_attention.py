@@ -40,6 +40,9 @@ except ImportError:
     )
 
 
+OPTIMIZED_VARIANTS = ("v1", "v2", "v3")
+
+
 def _env_paths(name: str) -> list[Path]:
     value = os.environ.get(name, "")
     if not value:
@@ -66,7 +69,7 @@ def _benchmark_cuda_fixture(
     *,
     warmup: int,
     iters: int,
-    optimized: bool,
+    optimized: bool | str,
 ) -> float:
     gpu_fixture = _fixture_to_cuda(fixture)
     for _ in range(warmup):
@@ -118,32 +121,47 @@ class TestDS4CudaReferenceAttention(unittest.TestCase):
             fixture,
             optimized=False,
         ).cpu()
-        actual = ds4_cuda_sparse_attention_from_fixture(
-            fixture,
-            optimized=True,
-        ).cpu()
         oracle = _torch_oracle(fixture)
-        results = [
-            compare_tensors(
-                f"optimized_vs_reference:{name}",
-                actual,
-                reference,
-                atol=atol,
-                rtol=rtol,
-            ),
-            compare_tensors(
-                f"optimized_vs_oracle:{name}",
-                actual,
-                oracle,
-                atol=atol,
-                rtol=rtol,
+        results = []
+        for variant in OPTIMIZED_VARIANTS:
+            actual = ds4_cuda_sparse_attention_from_fixture(
+                fixture,
+                optimized=variant,
+            ).cpu()
+            results.extend(
+                [
+                    compare_tensors(
+                        f"optimized_{variant}_vs_reference:{name}",
+                        actual,
+                        reference,
+                        atol=atol,
+                        rtol=rtol,
+                    ),
+                    compare_tensors(
+                        f"optimized_{variant}_vs_oracle:{name}",
+                        actual,
+                        oracle,
+                        atol=atol,
+                        rtol=rtol,
+                    ),
+                ]
             )
-        ]
+            if check_expected and "expected" in fixture:
+                results.append(
+                    compare_tensors(
+                        f"optimized_{variant}_vs_expected:{name}",
+                        actual,
+                        fixture["expected"],
+                        atol=atol,
+                        rtol=rtol,
+                    )
+                )
+
         if check_expected and "expected" in fixture:
             results.append(
                 compare_tensors(
-                    f"optimized_vs_expected:{name}",
-                    actual,
+                    f"reference_vs_expected:{name}",
+                    reference,
                     fixture["expected"],
                     atol=atol,
                     rtol=rtol,
@@ -195,20 +213,21 @@ class TestDS4CudaReferenceAttention(unittest.TestCase):
                     iters=bench_iters,
                     optimized=False,
                 )
-                opt_ms = _benchmark_cuda_fixture(
-                    fixture,
-                    warmup=bench_warmup,
-                    iters=bench_iters,
-                    optimized=True,
-                )
-                speedup = avg_ms / opt_ms if opt_ms else float("inf")
                 print(
                     f"BENCH cuda_reference:{spec.name}: avg_ms={avg_ms:.6g}"
                 )
-                print(
-                    f"BENCH cuda_optimized:{spec.name}: avg_ms={opt_ms:.6g} "
-                    f"speedup={speedup:.3f}x"
-                )
+                for variant in OPTIMIZED_VARIANTS:
+                    opt_ms = _benchmark_cuda_fixture(
+                        fixture,
+                        warmup=bench_warmup,
+                        iters=bench_iters,
+                        optimized=variant,
+                    )
+                    speedup = avg_ms / opt_ms if opt_ms else float("inf")
+                    print(
+                        f"BENCH cuda_optimized_{variant}:{spec.name}: "
+                        f"avg_ms={opt_ms:.6g} speedup={speedup:.3f}x"
+                    )
 
         self.assertFalse(
             failures,
