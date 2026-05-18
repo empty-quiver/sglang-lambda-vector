@@ -6,9 +6,10 @@ Run from the repository root:
       test/manual/dsv4/profile_ds4_cuda_split_attention.py
 
 The C++ extension emits one DSV4_CUDA_SPLIT_PROFILE line per profiled sample
-when DSV4_CUDA_REF_PROFILE_SPLIT is enabled. This script enables that flag only
-for a small number of samples, then disables it for the normal total-time
-benchmark.
+when DSV4_CUDA_REF_PROFILE_SPLIT is enabled. Set
+DSV4_CUDA_PROFILE_PARTIAL_STAGES=1 to also emit the v15 partial-kernel stage
+cycle counters. This script enables profiling flags only for a small number of
+samples, then disables them for the normal total-time benchmark.
 """
 
 from __future__ import annotations
@@ -45,6 +46,11 @@ def _fixture_to_cuda(fixture: dict[str, Any]) -> dict[str, Any]:
 
 def _set_profile_enabled(enabled: bool) -> None:
     os.environ["DSV4_CUDA_REF_PROFILE_SPLIT"] = "1" if enabled else "0"
+    partial_stages = os.environ.get("DSV4_CUDA_PROFILE_PARTIAL_STAGES", "0")
+    use_partial_stages = partial_stages not in {"", "0", "false", "False"}
+    os.environ["DSV4_CUDA_REF_PROFILE_PARTIAL_STAGES"] = (
+        "1" if enabled and use_partial_stages else "0"
+    )
 
 
 def _variant_list() -> list[str]:

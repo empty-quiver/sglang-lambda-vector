@@ -49,6 +49,15 @@ constexpr int kV15DimOuterRounds = kV11DimRounds / kV15DimRoundGroups;
 static_assert(
     kV11DimRounds % kV15DimRoundGroups == 0,
     "v15 expects dimension rounds to divide evenly into round groups");
+constexpr int kPartialProfileRowSetup = 0;
+constexpr int kPartialProfileScaleCache = 1;
+constexpr int kPartialProfileQk = 2;
+constexpr int kPartialProfileSoftmax = 3;
+constexpr int kPartialProfilePCache = 4;
+constexpr int kPartialProfilePvMma = 5;
+constexpr int kPartialProfilePartialStore = 6;
+constexpr int kPartialProfileBlocks = 7;
+constexpr int kPartialProfileSlots = 8;
 
 enum class AttentionVariant : int {
   kReference = 0,
@@ -109,18 +118,26 @@ bool split_profile_enabled() {
   return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+bool partial_stage_profile_enabled() {
+  const char* value = std::getenv("DSV4_CUDA_REF_PROFILE_PARTIAL_STAGES");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
 __device__ __forceinline__ float fp8_e4m3fn_to_float(uint8_t bits) {
   const int sign = bits & 0x80;
   const int exponent = (bits >> 3) & 0x0f;
   const int mantissa = bits & 0x07;
 
-  float value;
   if (exponent == 0) {
-    value = mantissa == 0 ? 0.0f : ldexpf(static_cast<float>(mantissa), -9);
+    const float value = static_cast<float>(mantissa) * 0.001953125f;
+    return sign ? -value : value;
   } else {
-    value = ldexpf(1.0f + static_cast<float>(mantissa) * 0.125f, exponent - 7);
+    const uint32_t fp32_bits =
+        (static_cast<uint32_t>(sign) << 24) |
+        (static_cast<uint32_t>(exponent + 120) << 23) |
+        (static_cast<uint32_t>(mantissa) << 20);
+    return __uint_as_float(fp32_bits);
   }
-  return sign ? -value : value;
 }
 
 __device__ __forceinline__ float bf16_bytes_to_float(const uint8_t* ptr) {
@@ -203,6 +220,15 @@ __device__ __forceinline__ float load_partial_acc(
     const __nv_bfloat16* partial_acc,
     int64_t offset) {
   return __bfloat162float(partial_acc[offset]);
+}
+
+__device__ __forceinline__ void add_partial_profile_cycles(
+    unsigned long long* profile_cycles,
+    int slot,
+    unsigned long long cycles) {
+  if (profile_cycles != nullptr && threadIdx.x == 0) {
+    atomicAdd(profile_cycles + slot, cycles);
+  }
 }
 
 __device__ __forceinline__ void reduce_sum_warp_block(float* shared, float& value) {
@@ -1669,7 +1695,8 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
     int row_tiles,
     float* __restrict__ partial_max,
     float* __restrict__ partial_sum,
-    PartialAccT* __restrict__ partial_acc) {
+    PartialAccT* __restrict__ partial_acc,
+    unsigned long long* __restrict__ profile_cycles) {
   namespace wmma = nvcuda::wmma;
 
   const int batch = blockIdx.x;
@@ -1681,6 +1708,12 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
   const int lane = threadIdx.x & 31;
   if (batch >= batch_size) {
     return;
+  }
+  const bool profile_this_block = profile_cycles != nullptr && PVMmaMode == 5;
+  unsigned long long profile_t0 = 0;
+  if (profile_this_block && threadIdx.x == 0) {
+    profile_t0 = clock64();
+    atomicAdd(profile_cycles + kPartialProfileBlocks, 1ULL);
   }
 
   constexpr int kPartialSharedWarps =
@@ -1728,6 +1761,12 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
     row_valid[threadIdx.x] = valid ? 1 : 0;
   }
   __syncthreads();
+  if (profile_this_block && threadIdx.x == 0) {
+    const unsigned long long now = clock64();
+    add_partial_profile_cycles(
+        profile_cycles, kPartialProfileRowSetup, now - profile_t0);
+    profile_t0 = now;
+  }
   if constexpr (CacheScales) {
     if (threadIdx.x < kScoreRowsPerBlock * kScaleCount) {
       const int row_slot = threadIdx.x / kScaleCount;
@@ -1740,6 +1779,12 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
     }
   }
   __syncthreads();
+  if (profile_this_block && threadIdx.x == 0) {
+    const unsigned long long now = clock64();
+    add_partial_profile_cycles(
+        profile_cycles, kPartialProfileScaleCache, now - profile_t0);
+    profile_t0 = now;
+  }
 
   if (warp < kScoreWarpsPerBlock) {
     wmma::fragment<wmma::matrix_a, kScoreTileM, kScoreTileN, kScoreTileK, __nv_bfloat16, wmma::row_major>
@@ -1788,6 +1833,11 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
     wmma::store_matrix_sync(score_shared[warp], acc_frag, kScoreTileN, wmma::mem_row_major);
   }
   __syncthreads();
+  if (profile_this_block && threadIdx.x == 0) {
+    const unsigned long long now = clock64();
+    add_partial_profile_cycles(profile_cycles, kPartialProfileQk, now - profile_t0);
+    profile_t0 = now;
+  }
 
   if (threadIdx.x < kScoreTileM) {
     const int head_slot = threadIdx.x;
@@ -1831,6 +1881,12 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
     partial_sum[state_offset] = tile_sum;
   }
   __syncthreads();
+  if (profile_this_block && threadIdx.x == 0) {
+    const unsigned long long now = clock64();
+    add_partial_profile_cycles(
+        profile_cycles, kPartialProfileSoftmax, now - profile_t0);
+    profile_t0 = now;
+  }
 
   if constexpr (PVMmaMode == 1) {
     // Experimental v10 path: treat the softmax weights as P and the decoded
@@ -2069,6 +2125,12 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
       }
     }
     __syncthreads();
+    if (profile_this_block && threadIdx.x == 0) {
+      const unsigned long long now = clock64();
+      add_partial_profile_cycles(
+          profile_cycles, kPartialProfilePCache, now - profile_t0);
+      profile_t0 = now;
+    }
 
     for (int outer_round = 0; outer_round < kV15DimOuterRounds; ++outer_round) {
       if (warp < kV11WarpsPerBlock) {
@@ -2113,6 +2175,12 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
         wmma::store_matrix_sync(score_shared[warp], pv_acc_frag, kScoreTileN, wmma::mem_row_major);
       }
       __syncthreads();
+      if (profile_this_block && threadIdx.x == 0) {
+        const unsigned long long now = clock64();
+        add_partial_profile_cycles(
+            profile_cycles, kPartialProfilePvMma, now - profile_t0);
+        profile_t0 = now;
+      }
 
       for (int idx = threadIdx.x;
            idx < kV15DimRoundGroups * kV11DimGroups * kScoreTileElems;
@@ -2137,6 +2205,12 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
         store_partial_acc(partial_acc, acc_offset, head < num_heads ? value : 0.0f);
       }
       __syncthreads();
+      if (profile_this_block && threadIdx.x == 0) {
+        const unsigned long long now = clock64();
+        add_partial_profile_cycles(
+            profile_cycles, kPartialProfilePartialStore, now - profile_t0);
+        profile_t0 = now;
+      }
     }
     return;
   }
@@ -2578,6 +2652,17 @@ torch::Tensor launch_ds4_cuda_attention(
            static_cast<int64_t>(kScoreTileM),
            static_cast<int64_t>(kHeadDim)},
           q.options().dtype(partial_acc_dtype));
+      const bool profile_partial_stages =
+          partial_stage_profile_enabled() && tensor_core_pv_rowgroup_accum;
+      torch::Tensor partial_stage_profile;
+      unsigned long long* partial_stage_profile_ptr = nullptr;
+      if (profile_partial_stages) {
+        partial_stage_profile = torch::zeros(
+            {static_cast<int64_t>(kPartialProfileSlots)},
+            q.options().dtype(torch::kInt64));
+        partial_stage_profile_ptr = reinterpret_cast<unsigned long long*>(
+            partial_stage_profile.data_ptr<int64_t>());
+      }
       dim3 split_grid(
           static_cast<unsigned int>(batch_size),
           static_cast<unsigned int>(head_tiles),
@@ -2618,7 +2703,8 @@ torch::Tensor launch_ds4_cuda_attention(
                 static_cast<int>(row_tiles),
                 partial_max.data_ptr<float>(),
                 partial_sum.data_ptr<float>(),
-                reinterpret_cast<__nv_bfloat16*>(partial_acc.data_ptr<at::BFloat16>()));
+                reinterpret_cast<__nv_bfloat16*>(partial_acc.data_ptr<at::BFloat16>()),
+                partial_stage_profile_ptr);
       } else if (tensor_core_pv_specialized_v_decode) {
         ds4_cuda_fused_v8_mma_partial_kernel<true, 4, __nv_bfloat16>
             <<<split_grid, split_block, 0, stream>>>(
@@ -2644,7 +2730,8 @@ torch::Tensor launch_ds4_cuda_attention(
                 static_cast<int>(row_tiles),
                 partial_max.data_ptr<float>(),
                 partial_sum.data_ptr<float>(),
-                reinterpret_cast<__nv_bfloat16*>(partial_acc.data_ptr<at::BFloat16>()));
+                reinterpret_cast<__nv_bfloat16*>(partial_acc.data_ptr<at::BFloat16>()),
+                nullptr);
       } else if (tensor_core_pv_cached_bf16_partial) {
         ds4_cuda_fused_v8_mma_partial_kernel<true, 3, __nv_bfloat16>
             <<<split_grid, split_block, 0, stream>>>(
@@ -2670,7 +2757,8 @@ torch::Tensor launch_ds4_cuda_attention(
                 static_cast<int>(row_tiles),
                 partial_max.data_ptr<float>(),
                 partial_sum.data_ptr<float>(),
-                reinterpret_cast<__nv_bfloat16*>(partial_acc.data_ptr<at::BFloat16>()));
+                reinterpret_cast<__nv_bfloat16*>(partial_acc.data_ptr<at::BFloat16>()),
+                nullptr);
       } else if (tensor_core_pv_cached) {
         ds4_cuda_fused_v8_mma_partial_kernel<true, 3>
             <<<split_grid, split_block, 0, stream>>>(
@@ -2696,7 +2784,8 @@ torch::Tensor launch_ds4_cuda_attention(
                 static_cast<int>(row_tiles),
                 partial_max.data_ptr<float>(),
                 partial_sum.data_ptr<float>(),
-                partial_acc.data_ptr<float>());
+                partial_acc.data_ptr<float>(),
+                nullptr);
       } else if (tensor_core_pv_parallel) {
         ds4_cuda_fused_v8_mma_partial_kernel<true, 2>
             <<<split_grid, split_block, 0, stream>>>(
@@ -2722,7 +2811,8 @@ torch::Tensor launch_ds4_cuda_attention(
                 static_cast<int>(row_tiles),
                 partial_max.data_ptr<float>(),
                 partial_sum.data_ptr<float>(),
-                partial_acc.data_ptr<float>());
+                partial_acc.data_ptr<float>(),
+                nullptr);
       } else if (tensor_core_pv) {
         ds4_cuda_fused_v8_mma_partial_kernel<true, 1>
             <<<split_grid, split_block, 0, stream>>>(
@@ -2748,7 +2838,8 @@ torch::Tensor launch_ds4_cuda_attention(
                 static_cast<int>(row_tiles),
                 partial_max.data_ptr<float>(),
                 partial_sum.data_ptr<float>(),
-                partial_acc.data_ptr<float>());
+                partial_acc.data_ptr<float>(),
+                nullptr);
       } else if (cache_scales) {
         ds4_cuda_fused_v8_mma_partial_kernel<true, 0>
             <<<split_grid, split_block, 0, stream>>>(
@@ -2774,7 +2865,8 @@ torch::Tensor launch_ds4_cuda_attention(
                 static_cast<int>(row_tiles),
                 partial_max.data_ptr<float>(),
                 partial_sum.data_ptr<float>(),
-                partial_acc.data_ptr<float>());
+                partial_acc.data_ptr<float>(),
+                nullptr);
       } else {
         ds4_cuda_fused_v8_mma_partial_kernel<false, 0>
             <<<split_grid, split_block, 0, stream>>>(
@@ -2800,7 +2892,8 @@ torch::Tensor launch_ds4_cuda_attention(
                 static_cast<int>(row_tiles),
                 partial_max.data_ptr<float>(),
                 partial_sum.data_ptr<float>(),
-                partial_acc.data_ptr<float>());
+                partial_acc.data_ptr<float>(),
+                nullptr);
       }
       if (profile_split) {
         C10_CUDA_CHECK(cudaEventRecord(partial_stop, stream));
@@ -2837,7 +2930,59 @@ torch::Tensor launch_ds4_cuda_attention(
       }
       if (profile_split) {
         C10_CUDA_CHECK(cudaEventRecord(reduce_stop, stream));
-        C10_CUDA_CHECK(cudaEventSynchronize(reduce_stop));
+      }
+      if (profile_partial_stages) {
+        if (profile_split) {
+          C10_CUDA_CHECK(cudaEventSynchronize(reduce_stop));
+        } else {
+          C10_CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+        auto partial_stage_profile_cpu = partial_stage_profile.cpu();
+        const int64_t* profile_values = partial_stage_profile_cpu.data_ptr<int64_t>();
+        const double profile_total = static_cast<double>(
+            profile_values[kPartialProfileRowSetup] +
+            profile_values[kPartialProfileScaleCache] +
+            profile_values[kPartialProfileQk] +
+            profile_values[kPartialProfileSoftmax] +
+            profile_values[kPartialProfilePCache] +
+            profile_values[kPartialProfilePvMma] +
+            profile_values[kPartialProfilePartialStore]);
+        const double inv_total = profile_total > 0.0 ? 100.0 / profile_total : 0.0;
+        std::fprintf(
+            stderr,
+            "DSV4_CUDA_PARTIAL_STAGE_PROFILE variant=%s batch=%lld heads=%lld "
+            "total_width=%lld head_tiles=%lld row_tiles=%lld blocks=%lld "
+            "row_setup_cycles=%lld scale_cache_cycles=%lld qk_cycles=%lld "
+            "softmax_cycles=%lld p_cache_cycles=%lld pv_mma_cycles=%lld "
+            "partial_store_cycles=%lld row_setup_pct=%.2f scale_cache_pct=%.2f "
+            "qk_pct=%.2f softmax_pct=%.2f p_cache_pct=%.2f pv_mma_pct=%.2f "
+            "partial_store_pct=%.2f\n",
+            attention_variant_name(variant),
+            static_cast<long long>(batch_size),
+            static_cast<long long>(num_heads),
+            static_cast<long long>(total_width),
+            static_cast<long long>(head_tiles),
+            static_cast<long long>(row_tiles),
+            static_cast<long long>(profile_values[kPartialProfileBlocks]),
+            static_cast<long long>(profile_values[kPartialProfileRowSetup]),
+            static_cast<long long>(profile_values[kPartialProfileScaleCache]),
+            static_cast<long long>(profile_values[kPartialProfileQk]),
+            static_cast<long long>(profile_values[kPartialProfileSoftmax]),
+            static_cast<long long>(profile_values[kPartialProfilePCache]),
+            static_cast<long long>(profile_values[kPartialProfilePvMma]),
+            static_cast<long long>(profile_values[kPartialProfilePartialStore]),
+            static_cast<double>(profile_values[kPartialProfileRowSetup]) * inv_total,
+            static_cast<double>(profile_values[kPartialProfileScaleCache]) * inv_total,
+            static_cast<double>(profile_values[kPartialProfileQk]) * inv_total,
+            static_cast<double>(profile_values[kPartialProfileSoftmax]) * inv_total,
+            static_cast<double>(profile_values[kPartialProfilePCache]) * inv_total,
+            static_cast<double>(profile_values[kPartialProfilePvMma]) * inv_total,
+            static_cast<double>(profile_values[kPartialProfilePartialStore]) * inv_total);
+      }
+      if (profile_split) {
+        if (!profile_partial_stages) {
+          C10_CUDA_CHECK(cudaEventSynchronize(reduce_stop));
+        }
         float partial_ms = 0.0f;
         float reduce_ms = 0.0f;
         C10_CUDA_CHECK(cudaEventElapsedTime(&partial_ms, partial_start, partial_stop));
