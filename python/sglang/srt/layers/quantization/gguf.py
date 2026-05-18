@@ -387,6 +387,14 @@ def _gguf_moe_block_size(qweight_type: int) -> int:
     return 8 if _is_hip else 4
 
 
+def _gguf_moe_masked_vec_enabled(qweight_type: int, qweight_type2: int) -> bool:
+    return (
+        _gguf_env_enabled("SGLANG_GGUF_MOE_MASKED_VEC")
+        and qweight_type in MMVQ_QUANT_TYPES
+        and qweight_type2 in MMVQ_QUANT_TYPES
+    )
+
+
 def fused_moe_gguf(
     x: torch.Tensor,
     w1: torch.Tensor,
@@ -430,9 +438,13 @@ def fused_moe_gguf(
         )
 
     out_hidden_states = torch.empty_like(x)
-    if not (_is_cuda and torch.cuda.is_current_stream_capturing()) and torch.any(
-        topk_ids < 0
-    ):
+    has_cold_experts = not (
+        _is_cuda and torch.cuda.is_current_stream_capturing()
+    ) and bool(torch.any(topk_ids < 0).item())
+    use_masked_vec = has_cold_experts and _gguf_moe_masked_vec_enabled(
+        qweight_type, qweight_type2
+    )
+    if has_cold_experts and not use_masked_vec:
         out_hidden_states = torch.zeros_like(x)
         active_mask = topk_ids >= 0
         active_topk_ids = topk_ids[active_mask].view(-1, 1).contiguous()
@@ -677,6 +689,9 @@ def fused_moe_gguf(
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
         top_k = topk_ids.shape[1]
+        masked_slots = None
+        if trace_enabled:
+            masked_slots = int((topk_ids < 0).sum().item())
 
         out = ggml_moe_a8_vec(x, w1, topk_ids, top_k, qweight_type, N, num_tokens)
         out = act(out)
@@ -688,7 +703,13 @@ def fused_moe_gguf(
             topk_weights.view(num_tokens, top_k, 1)
         )
         moe_sum(out, out_hidden_states)
-        trace_done("mmvq_vec", f"num_tokens={num_tokens} top_k={top_k} hidden={N}")
+        trace_extra = f"num_tokens={num_tokens} top_k={top_k} hidden={N}"
+        if masked_slots:
+            trace_extra = f"{trace_extra} masked_slots={masked_slots}"
+        trace_done(
+            "mmvq_vec_masked" if masked_slots else "mmvq_vec",
+            trace_extra,
+        )
     else:
         logger.warning_once(
             "There is no support for fast MoE kernel "
