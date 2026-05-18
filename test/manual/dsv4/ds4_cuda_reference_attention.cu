@@ -55,6 +55,7 @@ enum class AttentionVariant : int {
   kOptimizedV10 = 10,
   kOptimizedV11 = 11,
   kOptimizedV12 = 12,
+  kOptimizedV13 = 13,
 };
 
 __device__ __forceinline__ float fp8_e4m3fn_to_float(uint8_t bits) {
@@ -125,6 +126,32 @@ __device__ __forceinline__ float warp_reduce_sum(float value) {
   value += __shfl_down_sync(0xffffffff, value, 2);
   value += __shfl_down_sync(0xffffffff, value, 1);
   return value;
+}
+
+__device__ __forceinline__ void store_partial_acc(
+    float* partial_acc,
+    int64_t offset,
+    float value) {
+  partial_acc[offset] = value;
+}
+
+__device__ __forceinline__ void store_partial_acc(
+    __nv_bfloat16* partial_acc,
+    int64_t offset,
+    float value) {
+  partial_acc[offset] = __float2bfloat16(value);
+}
+
+__device__ __forceinline__ float load_partial_acc(
+    const float* partial_acc,
+    int64_t offset) {
+  return partial_acc[offset];
+}
+
+__device__ __forceinline__ float load_partial_acc(
+    const __nv_bfloat16* partial_acc,
+    int64_t offset) {
+  return __bfloat162float(partial_acc[offset]);
 }
 
 __device__ __forceinline__ void reduce_sum_warp_block(float* shared, float& value) {
@@ -1567,7 +1594,7 @@ __global__ void ds4_cuda_fused_v7_mma_attention_kernel(
   }
 }
 
-template <bool CacheScales, int PVMmaMode>
+template <bool CacheScales, int PVMmaMode, typename PartialAccT = float>
 __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
     const __nv_bfloat16* __restrict__ q,
     const uint8_t* __restrict__ swa_cache,
@@ -1591,7 +1618,7 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
     int row_tiles,
     float* __restrict__ partial_max,
     float* __restrict__ partial_sum,
-    float* __restrict__ partial_acc) {
+    PartialAccT* __restrict__ partial_acc) {
   namespace wmma = nvcuda::wmma;
 
   const int batch = blockIdx.x;
@@ -1810,7 +1837,7 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
               head_slot) *
                  kHeadDim +
              dim);
-        partial_acc[acc_offset] = head < num_heads ? value : 0.0f;
+        store_partial_acc(partial_acc, acc_offset, head < num_heads ? value : 0.0f);
       }
       __syncthreads();
     }
@@ -1880,7 +1907,7 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
               head_slot) *
                  kHeadDim +
              dim);
-        partial_acc[acc_offset] = head < num_heads ? value : 0.0f;
+        store_partial_acc(partial_acc, acc_offset, head < num_heads ? value : 0.0f);
       }
       __syncthreads();
     }
@@ -1956,7 +1983,7 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
               head_slot) *
                  kHeadDim +
              dim);
-        partial_acc[acc_offset] = head < num_heads ? value : 0.0f;
+        store_partial_acc(partial_acc, acc_offset, head < num_heads ? value : 0.0f);
       }
       __syncthreads();
     }
@@ -2001,15 +2028,17 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
             head_slot) *
                kHeadDim +
            dim);
-      partial_acc[acc_offset] = head < num_heads ? values[head_slot] : 0.0f;
+      store_partial_acc(
+          partial_acc, acc_offset, head < num_heads ? values[head_slot] : 0.0f);
     }
   }
 }
 
+template <typename PartialAccT = float>
 __global__ void ds4_cuda_fused_v8_reduce_kernel(
     const float* __restrict__ partial_max,
     const float* __restrict__ partial_sum,
-    const float* __restrict__ partial_acc,
+    const PartialAccT* __restrict__ partial_acc,
     const float* __restrict__ attn_sink,
     bool has_sink,
     int batch_size,
@@ -2091,7 +2120,7 @@ __global__ void ds4_cuda_fused_v8_reduce_kernel(
                 head_slot) *
                    kHeadDim +
                dim);
-          acc += partial_acc[acc_offset] * scale;
+          acc += load_partial_acc(partial_acc, acc_offset) * scale;
         }
       }
       const int64_t out_offset =
@@ -2365,29 +2394,61 @@ torch::Tensor launch_ds4_cuda_attention(
     case AttentionVariant::kOptimizedV9:
     case AttentionVariant::kOptimizedV10:
     case AttentionVariant::kOptimizedV11:
-    case AttentionVariant::kOptimizedV12: {
+    case AttentionVariant::kOptimizedV12:
+    case AttentionVariant::kOptimizedV13: {
       const bool cache_scales = variant != AttentionVariant::kOptimizedV8;
       const bool tensor_core_pv = variant == AttentionVariant::kOptimizedV10;
       const bool tensor_core_pv_parallel = variant == AttentionVariant::kOptimizedV11;
       const bool tensor_core_pv_cached = variant == AttentionVariant::kOptimizedV12;
+      const bool tensor_core_pv_cached_bf16_partial =
+          variant == AttentionVariant::kOptimizedV13;
       const int64_t head_tiles = (num_heads + kScoreTileM - 1) / kScoreTileM;
       const int64_t row_tiles = (total_width + kScoreRowsPerBlock - 1) / kScoreRowsPerBlock;
       auto partial_max = torch::empty(
           {batch_size, head_tiles, row_tiles, static_cast<int64_t>(kScoreTileM)},
           q.options().dtype(torch::kFloat32));
       auto partial_sum = torch::empty_like(partial_max);
+      const auto partial_acc_dtype = tensor_core_pv_cached_bf16_partial
+          ? torch::kBFloat16
+          : torch::kFloat32;
       auto partial_acc = torch::empty(
           {batch_size,
            head_tiles,
            row_tiles,
            static_cast<int64_t>(kScoreTileM),
            static_cast<int64_t>(kHeadDim)},
-          q.options().dtype(torch::kFloat32));
+          q.options().dtype(partial_acc_dtype));
       dim3 split_grid(
           static_cast<unsigned int>(batch_size),
           static_cast<unsigned int>(head_tiles),
           static_cast<unsigned int>(row_tiles));
-      if (tensor_core_pv_cached) {
+      if (tensor_core_pv_cached_bf16_partial) {
+        ds4_cuda_fused_v8_mma_partial_kernel<true, 3, __nv_bfloat16>
+            <<<split_grid, split_block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
+                swa_k_cache.data_ptr<uint8_t>(),
+                swa_indices.data_ptr<int32_t>(),
+                swa_topk_lengths.data_ptr<int32_t>(),
+                static_cast<int>(swa_width),
+                static_cast<int>(swa_page_size),
+                static_cast<int>(swa_k_cache.size(3)),
+                has_extra ? extra_k_cache.data_ptr<uint8_t>() : nullptr,
+                has_extra ? extra_indices.data_ptr<int32_t>() : nullptr,
+                has_extra ? extra_topk_lengths.data_ptr<int32_t>() : nullptr,
+                static_cast<int>(extra_width),
+                static_cast<int>(extra_page_size),
+                has_extra ? static_cast<int>(extra_k_cache.size(3)) : 0,
+                has_extra,
+                static_cast<float>(softmax_scale),
+                static_cast<int>(batch_size),
+                static_cast<int>(num_heads),
+                static_cast<int>(total_width),
+                static_cast<int>(head_tiles),
+                static_cast<int>(row_tiles),
+                partial_max.data_ptr<float>(),
+                partial_sum.data_ptr<float>(),
+                reinterpret_cast<__nv_bfloat16*>(partial_acc.data_ptr<at::BFloat16>()));
+      } else if (tensor_core_pv_cached) {
         ds4_cuda_fused_v8_mma_partial_kernel<true, 3>
             <<<split_grid, split_block, 0, at::cuda::getCurrentCUDAStream()>>>(
                 reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
@@ -2519,18 +2580,33 @@ torch::Tensor launch_ds4_cuda_attention(
                 partial_acc.data_ptr<float>());
       }
       C10_CUDA_KERNEL_LAUNCH_CHECK();
-      ds4_cuda_fused_v8_reduce_kernel
-          <<<fused_grid, split_block, 0, at::cuda::getCurrentCUDAStream()>>>(
-              partial_max.data_ptr<float>(),
-              partial_sum.data_ptr<float>(),
-              partial_acc.data_ptr<float>(),
-              has_sink ? attn_sink.data_ptr<float>() : nullptr,
-              has_sink,
-              static_cast<int>(batch_size),
-              static_cast<int>(num_heads),
-              static_cast<int>(head_tiles),
-              static_cast<int>(row_tiles),
-              reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
+      if (tensor_core_pv_cached_bf16_partial) {
+        ds4_cuda_fused_v8_reduce_kernel<__nv_bfloat16>
+            <<<fused_grid, split_block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                partial_max.data_ptr<float>(),
+                partial_sum.data_ptr<float>(),
+                reinterpret_cast<const __nv_bfloat16*>(partial_acc.data_ptr<at::BFloat16>()),
+                has_sink ? attn_sink.data_ptr<float>() : nullptr,
+                has_sink,
+                static_cast<int>(batch_size),
+                static_cast<int>(num_heads),
+                static_cast<int>(head_tiles),
+                static_cast<int>(row_tiles),
+                reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
+      } else {
+        ds4_cuda_fused_v8_reduce_kernel<float>
+            <<<fused_grid, split_block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                partial_max.data_ptr<float>(),
+                partial_sum.data_ptr<float>(),
+                partial_acc.data_ptr<float>(),
+                has_sink ? attn_sink.data_ptr<float>() : nullptr,
+                has_sink,
+                static_cast<int>(batch_size),
+                static_cast<int>(num_heads),
+                static_cast<int>(head_tiles),
+                static_cast<int>(row_tiles),
+                reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
+      }
       break;
     }
   }
@@ -2982,6 +3058,33 @@ torch::Tensor ds4_cuda_optimized_v12_attention(
       extra_topk_lengths,
       extra_page_size,
       AttentionVariant::kOptimizedV12);
+}
+
+torch::Tensor ds4_cuda_optimized_v13_attention(
+    torch::Tensor q,
+    torch::Tensor swa_k_cache,
+    torch::Tensor swa_indices,
+    torch::Tensor swa_topk_lengths,
+    int64_t swa_page_size,
+    double softmax_scale,
+    torch::Tensor attn_sink,
+    torch::Tensor extra_k_cache,
+    torch::Tensor extra_indices,
+    torch::Tensor extra_topk_lengths,
+    int64_t extra_page_size) {
+  return launch_ds4_cuda_attention(
+      q,
+      swa_k_cache,
+      swa_indices,
+      swa_topk_lengths,
+      swa_page_size,
+      softmax_scale,
+      attn_sink,
+      extra_k_cache,
+      extra_indices,
+      extra_topk_lengths,
+      extra_page_size,
+      AttentionVariant::kOptimizedV13);
 }
 
 torch::Tensor ds4_cuda_reference_scores(
