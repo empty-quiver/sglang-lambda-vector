@@ -9,6 +9,7 @@ the capture includes packed weights.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -69,6 +70,41 @@ def _check_current_kernel(capture: dict, device: str):
     _assert_close("current_kernel_active_out", out, capture["active_out"])
 
 
+def _check_masked_kernel(capture: dict, device: str):
+    missing = [key for key in ("w1", "w2") if key not in capture]
+    if missing:
+        print(
+            "masked_kernel: skipped; capture does not include "
+            f"{', '.join(missing)}. Set SGLANG_GGUF_MOE_CAPTURE_WEIGHTS=1.",
+        )
+        return
+
+    repo_python = Path(__file__).resolve().parents[1] / "python"
+    sys.path.insert(0, str(repo_python))
+
+    os.environ["SGLANG_GGUF_MOE_MASKED_VEC"] = "1"
+    from sglang.srt.layers.quantization.gguf import fused_moe_gguf
+
+    x = capture["x"].to(device)
+    topk_weights = capture["topk_weights"].to(device)
+    topk_ids = capture["topk_ids"].to(device).int()
+    w1 = capture["w1"].to(device)
+    w2 = capture["w2"].to(device)
+
+    out = fused_moe_gguf(
+        x=x,
+        w1=w1,
+        w2=w2,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        qweight_type=int(capture["qweight_type"]),
+        qweight_type2=int(capture["qweight_type2"]),
+        activation=capture["activation"],
+        debug_layer=capture.get("debug_layer"),
+    ).cpu()
+    _assert_close("masked_kernel_full_out", out, capture["out_hidden_states"])
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("capture", type=Path)
@@ -81,6 +117,11 @@ def main() -> int:
         "--skip-current-kernel",
         action="store_true",
         help="Only validate saved active-filter tensors.",
+    )
+    parser.add_argument(
+        "--skip-masked-kernel",
+        action="store_true",
+        help="Skip rerunning the masked full-token kernel path.",
     )
     args = parser.parse_args()
 
@@ -100,6 +141,11 @@ def main() -> int:
             print("current_kernel: skipped; GGUF CUDA kernel requires CUDA")
         else:
             _check_current_kernel(capture, args.device)
+    if not args.skip_masked_kernel:
+        if args.device == "cpu":
+            print("masked_kernel: skipped; GGUF CUDA kernel requires CUDA")
+        else:
+            _check_masked_kernel(capture, args.device)
     return 0
 
 
