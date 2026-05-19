@@ -235,6 +235,11 @@ constexpr int kScoreWarpsPerBlock = 4;
 constexpr int kScoreRowsPerBlock = kScoreTileN * kScoreWarpsPerBlock;
 constexpr int kPreparedKTileElems = kScoreTileK * kScoreRowsPerBlock;
 constexpr int kPreparedVTileElems = kScoreRowsPerBlock * kScoreTileK;
+constexpr int kV56CommonSwaWidth = 128;
+constexpr int kV56CommonExtraWidth = 512;
+constexpr int kV56CommonSwaPageSize = 256;
+constexpr int kV56CommonExtraPageSize = 64;
+constexpr int kV56CommonRowStride = 584;
 constexpr int kV44ScoreWarpsPerBlock = 2;
 constexpr int kV44ScoreRowsPerBlock = kScoreTileN * kV44ScoreWarpsPerBlock;
 constexpr int kV44PreparedKTileElems = kScoreTileK * kV44ScoreRowsPerBlock;
@@ -428,6 +433,7 @@ enum class AttentionVariant : int {
   kOptimizedV53 = 55,
   kOptimizedV54 = 56,
   kOptimizedV55 = 57,
+  kOptimizedV56 = 58,
 };
 
 const char* attention_variant_name(AttentionVariant variant) {
@@ -546,6 +552,8 @@ const char* attention_variant_name(AttentionVariant variant) {
       return "v54";
     case AttentionVariant::kOptimizedV55:
       return "v55";
+    case AttentionVariant::kOptimizedV56:
+      return "v56";
   }
   return "unknown";
 }
@@ -1172,6 +1180,109 @@ __global__ void ds4_cuda_prepare_kv_tiles_kernel(
     } else {
       prepared_k[tile_base + idx] = value;
     }
+    prepared_v[tile_base + row_slot * kScoreTileK + dim_slot] = value;
+  }
+}
+
+__global__ void ds4_cuda_prepare_kv_tiles_common_cr4_kernel(
+    const uint8_t* __restrict__ swa_cache,
+    const int32_t* __restrict__ swa_indices,
+    const int32_t* __restrict__ swa_lengths,
+    const uint8_t* __restrict__ extra_cache,
+    const int32_t* __restrict__ extra_indices,
+    const int32_t* __restrict__ extra_lengths,
+    int batch_size,
+    int row_tiles,
+    __nv_bfloat16* __restrict__ prepared_k,
+    __nv_bfloat16* __restrict__ prepared_v) {
+  const int batch = blockIdx.x;
+  const int row_tile = blockIdx.y;
+  const int dim_tile = blockIdx.z;
+  if (batch >= batch_size) {
+    return;
+  }
+
+  const int dim_base = dim_tile * kScoreTileK;
+  __shared__ const uint8_t* row_ptrs[kScoreRowsPerBlock];
+  __shared__ uint8_t row_valid[kScoreRowsPerBlock];
+  __shared__ float row_scales[kScoreRowsPerBlock][kScaleCount];
+
+  if (threadIdx.x < kScoreRowsPerBlock) {
+    const int row_slot = threadIdx.x;
+    const bool from_swa = row_tile < (kV56CommonSwaWidth / kScoreRowsPerBlock);
+    const int local_row =
+        from_swa ? row_tile * kScoreRowsPerBlock + row_slot
+                 : (row_tile - (kV56CommonSwaWidth / kScoreRowsPerBlock)) *
+                           kScoreRowsPerBlock +
+                       row_slot;
+    const int width =
+        from_swa ? kV56CommonSwaWidth : kV56CommonExtraWidth;
+    const int valid_len = clamped_length(
+        from_swa ? swa_lengths : extra_lengths,
+        batch,
+        width);
+    const bool valid = local_row < valid_len;
+    const uint8_t* packed = nullptr;
+    if (valid) {
+      const int32_t raw_index =
+          from_swa ? swa_indices[batch * kV56CommonSwaWidth + local_row]
+                   : extra_indices[batch * kV56CommonExtraWidth + local_row];
+      const int index = raw_index < 0 ? 0 : raw_index;
+      if (from_swa) {
+        const int page = index >> 8;
+        const int token = index & (kV56CommonSwaPageSize - 1);
+        packed = swa_cache +
+                 (static_cast<int64_t>(page) * kV56CommonSwaPageSize + token) *
+                     kV56CommonRowStride;
+      } else {
+        const int page = index >> 6;
+        const int token = index & (kV56CommonExtraPageSize - 1);
+        packed = extra_cache +
+                 (static_cast<int64_t>(page) * kV56CommonExtraPageSize + token) *
+                     kV56CommonRowStride;
+      }
+    }
+    row_ptrs[row_slot] = packed;
+    row_valid[row_slot] = valid ? 1 : 0;
+  }
+  __syncthreads();
+
+  for (int idx = threadIdx.x; idx < kScoreRowsPerBlock * kScaleCount;
+       idx += blockDim.x) {
+    const int row_slot = idx / kScaleCount;
+    const int scale_slot = idx - row_slot * kScaleCount;
+    const uint8_t* packed = row_ptrs[row_slot];
+    row_scales[row_slot][scale_slot] =
+        row_valid[row_slot]
+            ? exp2f(static_cast<float>(packed[kScaleOffset + scale_slot]) - 127.0f)
+            : 0.0f;
+  }
+  __syncthreads();
+
+  const int64_t tile_base =
+      (((static_cast<int64_t>(batch) * row_tiles + row_tile) * kScoreKTileCount +
+        dim_tile) *
+       kPreparedKTileElems);
+  for (int idx = threadIdx.x; idx < kPreparedKTileElems; idx += blockDim.x) {
+    const int dim_slot = idx / kScoreRowsPerBlock;
+    const int row_slot = idx - dim_slot * kScoreRowsPerBlock;
+    const int dim = dim_base + dim_slot;
+    __nv_bfloat16 value = __float2bfloat16(0.0f);
+    if (row_valid[row_slot]) {
+      const uint8_t* packed = row_ptrs[row_slot];
+      if (dim < kNopeDim) {
+        const int scale_slot = dim / kScaleGroup;
+        const float decoded =
+            fp8_e4m3fn_to_float(packed[dim]) * row_scales[row_slot][scale_slot];
+        value = __float2bfloat16(decoded);
+      } else {
+        value = bf16_bytes_to_bfloat16(packed + kNopeDim + (dim - kNopeDim) * 2);
+      }
+    }
+    const int row_group = row_slot / kScoreTileN;
+    const int row_lane = row_slot - row_group * kScoreTileN;
+    prepared_k[tile_base + row_group * kScoreTileElems +
+               dim_slot * kScoreTileN + row_lane] = value;
     prepared_v[tile_base + row_slot * kScoreTileK + dim_slot] = value;
   }
 }
@@ -8573,18 +8684,19 @@ torch::Tensor launch_ds4_cuda_attention(
     variant = total_width <= kV26TinyTotalWidth ? AttentionVariant::kOptimizedV5
                                                 : AttentionVariant::kOptimizedV23;
   }
-  if (variant == AttentionVariant::kOptimizedV55) {
-    const bool v55_common_path =
+  if (variant == AttentionVariant::kOptimizedV55 ||
+      variant == AttentionVariant::kOptimizedV56) {
+    const bool common_cr4_path =
         has_extra &&
         num_heads == 64 &&
-        swa_width == 128 &&
-        extra_width == 512 &&
-        total_width == 640 &&
-        swa_page_size == 256 &&
-        extra_page_size == 64 &&
-        swa_k_cache.size(3) == 584 &&
-        extra_k_cache.size(3) == 584;
-    if (!v55_common_path) {
+        swa_width == kV56CommonSwaWidth &&
+        extra_width == kV56CommonExtraWidth &&
+        total_width == kV56CommonSwaWidth + kV56CommonExtraWidth &&
+        swa_page_size == kV56CommonSwaPageSize &&
+        extra_page_size == kV56CommonExtraPageSize &&
+        swa_k_cache.size(3) == kV56CommonRowStride &&
+        extra_k_cache.size(3) == kV56CommonRowStride;
+    if (!common_cr4_path) {
       variant = AttentionVariant::kOptimizedV53;
     }
   }
@@ -8873,7 +8985,8 @@ torch::Tensor launch_ds4_cuda_attention(
     case AttentionVariant::kOptimizedV52:
     case AttentionVariant::kOptimizedV53:
     case AttentionVariant::kOptimizedV54:
-    case AttentionVariant::kOptimizedV55: {
+    case AttentionVariant::kOptimizedV55:
+    case AttentionVariant::kOptimizedV56: {
       const bool cache_scales = variant != AttentionVariant::kOptimizedV8;
       const bool tensor_core_pv = variant == AttentionVariant::kOptimizedV10;
       const bool tensor_core_pv_parallel = variant == AttentionVariant::kOptimizedV11;
@@ -8888,7 +9001,8 @@ torch::Tensor launch_ds4_cuda_attention(
           variant == AttentionVariant::kOptimizedV52 ||
           variant == AttentionVariant::kOptimizedV53 ||
           variant == AttentionVariant::kOptimizedV54 ||
-          variant == AttentionVariant::kOptimizedV55;
+          variant == AttentionVariant::kOptimizedV55 ||
+          variant == AttentionVariant::kOptimizedV56;
       const bool tensor_core_pv_rowgroup_accum =
           variant == AttentionVariant::kOptimizedV15 ||
           variant == AttentionVariant::kOptimizedV16 ||
@@ -8967,7 +9081,8 @@ torch::Tensor launch_ds4_cuda_attention(
           variant == AttentionVariant::kOptimizedV52 ||
           variant == AttentionVariant::kOptimizedV53 ||
           variant == AttentionVariant::kOptimizedV54 ||
-          variant == AttentionVariant::kOptimizedV55;
+          variant == AttentionVariant::kOptimizedV55 ||
+          variant == AttentionVariant::kOptimizedV56;
       const bool tensor_core_pv_prepared_kv_direct_p =
           variant == AttentionVariant::kOptimizedV45 ||
           variant == AttentionVariant::kOptimizedV49A ||
@@ -8986,11 +9101,14 @@ torch::Tensor launch_ds4_cuda_attention(
       const bool tensor_core_pv_v52_rowgroup_k_direct_prepared_wmma =
           variant == AttentionVariant::kOptimizedV52;
       const bool tensor_core_pv_v53_warp_softmax_rowgroup_k_direct_prepared_wmma =
-          variant == AttentionVariant::kOptimizedV53;
+          variant == AttentionVariant::kOptimizedV53 ||
+          variant == AttentionVariant::kOptimizedV56;
       const bool tensor_core_pv_v54_staged_k_warp_softmax_rowgroup_direct_prepared_wmma =
           variant == AttentionVariant::kOptimizedV54;
       const bool tensor_core_pv_v55_dimsplit_qk_warp_softmax_rowgroup_direct_prepared_wmma =
           variant == AttentionVariant::kOptimizedV55;
+      const bool tensor_core_pv_v56_common_prepared_kv_producer =
+          variant == AttentionVariant::kOptimizedV56;
       const bool tensor_core_pv_prepared_p_split =
           variant == AttentionVariant::kOptimizedV48;
       const bool tensor_core_pv_grouped_head_k_reuse =
@@ -9244,6 +9362,18 @@ torch::Tensor launch_ds4_cuda_attention(
               has_extra,
               static_cast<int>(batch_size),
               static_cast<int>(total_width),
+              static_cast<int>(row_tiles),
+              reinterpret_cast<__nv_bfloat16*>(prepared_k.data_ptr<at::BFloat16>()),
+              reinterpret_cast<__nv_bfloat16*>(prepared_v.data_ptr<at::BFloat16>()));
+        } else if (tensor_core_pv_v56_common_prepared_kv_producer) {
+          ds4_cuda_prepare_kv_tiles_common_cr4_kernel<<<prepare_grid, prepare_block, 0, stream>>>(
+              swa_k_cache.data_ptr<uint8_t>(),
+              swa_indices.data_ptr<int32_t>(),
+              swa_topk_lengths.data_ptr<int32_t>(),
+              extra_k_cache.data_ptr<uint8_t>(),
+              extra_indices.data_ptr<int32_t>(),
+              extra_topk_lengths.data_ptr<int32_t>(),
+              static_cast<int>(batch_size),
               static_cast<int>(row_tiles),
               reinterpret_cast<__nv_bfloat16*>(prepared_k.data_ptr<at::BFloat16>()),
               reinterpret_cast<__nv_bfloat16*>(prepared_v.data_ptr<at::BFloat16>()));
@@ -13226,6 +13356,33 @@ torch::Tensor ds4_cuda_optimized_v55_attention(
       extra_topk_lengths,
       extra_page_size,
       AttentionVariant::kOptimizedV55);
+}
+
+torch::Tensor ds4_cuda_optimized_v56_attention(
+    torch::Tensor q,
+    torch::Tensor swa_k_cache,
+    torch::Tensor swa_indices,
+    torch::Tensor swa_topk_lengths,
+    int64_t swa_page_size,
+    double softmax_scale,
+    torch::Tensor attn_sink,
+    torch::Tensor extra_k_cache,
+    torch::Tensor extra_indices,
+    torch::Tensor extra_topk_lengths,
+    int64_t extra_page_size) {
+  return launch_ds4_cuda_attention(
+      q,
+      swa_k_cache,
+      swa_indices,
+      swa_topk_lengths,
+      swa_page_size,
+      softmax_scale,
+      attn_sink,
+      extra_k_cache,
+      extra_indices,
+      extra_topk_lengths,
+      extra_page_size,
+      AttentionVariant::kOptimizedV56);
 }
 
 torch::Tensor ds4_cuda_reference_scores(
