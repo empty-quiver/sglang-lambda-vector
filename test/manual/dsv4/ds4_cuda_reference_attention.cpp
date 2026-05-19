@@ -676,6 +676,45 @@ torch::Tensor ds4_cuda_optimized_v50_attention(
     torch::Tensor extra_topk_lengths,
     int64_t extra_page_size);
 
+torch::Tensor ds4_cuda_optimized_v51_attention(
+    torch::Tensor q,
+    torch::Tensor swa_k_cache,
+    torch::Tensor swa_indices,
+    torch::Tensor swa_topk_lengths,
+    int64_t swa_page_size,
+    double softmax_scale,
+    torch::Tensor attn_sink,
+    torch::Tensor extra_k_cache,
+    torch::Tensor extra_indices,
+    torch::Tensor extra_topk_lengths,
+    int64_t extra_page_size);
+
+torch::Tensor ds4_cuda_optimized_v52_attention(
+    torch::Tensor q,
+    torch::Tensor swa_k_cache,
+    torch::Tensor swa_indices,
+    torch::Tensor swa_topk_lengths,
+    int64_t swa_page_size,
+    double softmax_scale,
+    torch::Tensor attn_sink,
+    torch::Tensor extra_k_cache,
+    torch::Tensor extra_indices,
+    torch::Tensor extra_topk_lengths,
+    int64_t extra_page_size);
+
+torch::Tensor ds4_cuda_optimized_v53_attention(
+    torch::Tensor q,
+    torch::Tensor swa_k_cache,
+    torch::Tensor swa_indices,
+    torch::Tensor swa_topk_lengths,
+    int64_t swa_page_size,
+    double softmax_scale,
+    torch::Tensor attn_sink,
+    torch::Tensor extra_k_cache,
+    torch::Tensor extra_indices,
+    torch::Tensor extra_topk_lengths,
+    int64_t extra_page_size);
+
 torch::Tensor ds4_cuda_reference_scores(
     torch::Tensor q,
     torch::Tensor swa_k_cache,
@@ -909,6 +948,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "ds4_cuda_optimized_v50_attention",
       &ds4_cuda_optimized_v50_attention,
       "Debug CUDA DS4 sparse attention optimized v50 standalone direct prepared-KV WMMA loads");
+  m.def(
+      "ds4_cuda_optimized_v51_attention",
+      &ds4_cuda_optimized_v51_attention,
+      "Debug CUDA DS4 sparse attention optimized v51 warp-softmax standalone direct prepared-KV WMMA loads");
+  m.def(
+      "ds4_cuda_optimized_v52_attention",
+      &ds4_cuda_optimized_v52_attention,
+      "Debug CUDA DS4 sparse attention optimized v52 row-group prepared-K standalone direct prepared-KV WMMA loads");
+  m.def(
+      "ds4_cuda_optimized_v53_attention",
+      &ds4_cuda_optimized_v53_attention,
+      "Debug CUDA DS4 sparse attention optimized v53 warp-softmax row-group prepared-K standalone direct prepared-KV WMMA loads");
   m.def(
       "ds4_cuda_reference_scores",
       &ds4_cuda_reference_scores,

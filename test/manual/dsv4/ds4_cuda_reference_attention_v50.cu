@@ -18,6 +18,7 @@ constexpr int kScoreKTileCount = kHeadDim / kScoreTileK;
 constexpr int kScoreWarpsPerBlock = 4;
 constexpr int kScoreRowsPerBlock = kScoreTileN * kScoreWarpsPerBlock;
 constexpr int kPreparedKTileElems = kScoreTileK * kScoreRowsPerBlock;
+constexpr int kPreparedKRowGroupTileElems = kScoreWarpsPerBlock * kScoreTileElems;
 constexpr int kPreparedVTileElems = kScoreRowsPerBlock * kScoreTileK;
 constexpr int kV7Threads = 512;
 constexpr int kV8Threads = kV7Threads;
@@ -32,6 +33,9 @@ static_assert(
 static_assert(
     kV11DimRounds % kV15DimRoundGroups == 0,
     "DS4 v50 expects P@V dim rounds to divide evenly into outer rounds");
+static_assert(
+    kPreparedKRowGroupTileElems == kPreparedKTileElems,
+    "DS4 v52 row-group K layout preserves the existing prepared-K allocation size");
 
 constexpr int kPartialProfileRowSetup = 0;
 constexpr int kPartialProfileQk = 2;
@@ -62,6 +66,24 @@ __device__ __forceinline__ void add_partial_profile_cycles(
   if (profile_cycles != nullptr && threadIdx.x == 0) {
     atomicAdd(profile_cycles + slot, cycles);
   }
+}
+
+__device__ __forceinline__ float warp_reduce_sum(float value) {
+  value += __shfl_down_sync(0xffffffff, value, 16);
+  value += __shfl_down_sync(0xffffffff, value, 8);
+  value += __shfl_down_sync(0xffffffff, value, 4);
+  value += __shfl_down_sync(0xffffffff, value, 2);
+  value += __shfl_down_sync(0xffffffff, value, 1);
+  return value;
+}
+
+__device__ __forceinline__ float warp_reduce_max(float value) {
+  value = fmaxf(value, __shfl_down_sync(0xffffffff, value, 16));
+  value = fmaxf(value, __shfl_down_sync(0xffffffff, value, 8));
+  value = fmaxf(value, __shfl_down_sync(0xffffffff, value, 4));
+  value = fmaxf(value, __shfl_down_sync(0xffffffff, value, 2));
+  value = fmaxf(value, __shfl_down_sync(0xffffffff, value, 1));
+  return value;
 }
 
 __device__ __forceinline__ const uint8_t* selected_row_ptr(
@@ -161,7 +183,10 @@ __device__ __forceinline__ const uint8_t* selected_combined_row_ptr(
 // with leading dimension 16. The only cache-local state here is Q reuse,
 // softmax probabilities, and the BF16 partial accumulator consumed by the
 // existing DS4 reduction kernel.
-template <bool ProfileStages = false>
+template <
+    bool ProfileStages = false,
+    bool WarpSoftmax = false,
+    bool RowGroupPreparedK = false>
 __global__ void __launch_bounds__(kV8Threads, 1)
 ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
     const __nv_bfloat16* __restrict__ q,
@@ -329,8 +354,13 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
                 kScoreKTileCount +
             (dim_base / kScoreTileK)) *
            kPreparedKTileElems);
-      wmma::load_matrix_sync(
-          k_frag, prepared_k + prepared_base + warp_row_base, kScoreRowsPerBlock);
+      if constexpr (RowGroupPreparedK) {
+        wmma::load_matrix_sync(
+            k_frag, prepared_k + prepared_base + warp * kScoreTileElems, kScoreTileK);
+      } else {
+        wmma::load_matrix_sync(
+            k_frag, prepared_k + prepared_base + warp_row_base, kScoreRowsPerBlock);
+      }
       wmma::mma_sync(acc_frag, q_frag, k_frag, acc_frag);
       __syncwarp();
       if (profile_this_block && threadIdx.x == 0) {
@@ -361,7 +391,59 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
     profile_t0 = now;
   }
 
-  if (threadIdx.x < kScoreTileM) {
+  if constexpr (WarpSoftmax) {
+    if (warp < kScoreTileM) {
+      const int head_slot = warp;
+      const int head = head_base + head_slot;
+      float local_max = -INFINITY;
+#pragma unroll
+      for (int row_slot = lane; row_slot < kScoreRowsPerBlock; row_slot += 32) {
+        if (head < num_heads && row_valid[row_slot]) {
+          const int row_warp = row_slot / kScoreTileN;
+          const int row_lane = row_slot - row_warp * kScoreTileN;
+          const float score =
+              score_shared[row_warp][head_slot * kScoreTileN + row_lane] *
+              softmax_scale;
+          local_max = fmaxf(local_max, score);
+        }
+      }
+      float tile_max = warp_reduce_max(local_max);
+      tile_max = __shfl_sync(0xffffffff, tile_max, 0);
+
+      float local_sum = 0.0f;
+#pragma unroll
+      for (int row_slot = lane; row_slot < kScoreRowsPerBlock; row_slot += 32) {
+        float weight = 0.0f;
+        if (head < num_heads && row_valid[row_slot]) {
+          const int row_warp = row_slot / kScoreTileN;
+          const int row_lane = row_slot - row_warp * kScoreTileN;
+          const float score =
+              score_shared[row_warp][head_slot * kScoreTileN + row_lane] *
+              softmax_scale;
+          weight = expf(score - tile_max);
+          local_sum += weight;
+        }
+        const int row_warp = row_slot / kScoreTileN;
+        const int row_lane = row_slot - row_warp * kScoreTileN;
+        p_shared[row_warp][head_slot * kScoreTileN + row_lane] =
+            __float2bfloat16(weight);
+      }
+      float tile_sum = warp_reduce_sum(local_sum);
+      tile_sum = __shfl_sync(0xffffffff, tile_sum, 0);
+
+      if (lane == 0) {
+        tile_max_shared[head_slot] = tile_max;
+        tile_sum_shared[head_slot] = tile_sum;
+        const int64_t state_offset =
+            (((static_cast<int64_t>(batch) * head_tiles + head_tile) * row_tiles +
+              row_tile) *
+                 kScoreTileM +
+             head_slot);
+        partial_max[state_offset] = tile_max;
+        partial_sum[state_offset] = tile_sum;
+      }
+    }
+  } else if (threadIdx.x < kScoreTileM) {
     const int head_slot = threadIdx.x;
     const int head = head_base + head_slot;
     float tile_max = -INFINITY;
@@ -501,7 +583,8 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
 
 }  // namespace
 
-void ds4_cuda_launch_v50_direct_prepared_wmma_partial(
+template <bool WarpSoftmax, bool RowGroupPreparedK>
+void ds4_cuda_launch_direct_prepared_wmma_partial_variant(
     dim3 grid,
     dim3 block,
     cudaStream_t stream,
@@ -533,7 +616,10 @@ void ds4_cuda_launch_v50_direct_prepared_wmma_partial(
     const __nv_bfloat16* prepared_k,
     const __nv_bfloat16* prepared_v) {
   if (profile_stages) {
-    ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel<true>
+    ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel<
+        true,
+        WarpSoftmax,
+        RowGroupPreparedK>
         <<<grid, block, 0, stream>>>(
             q,
             swa_cache,
@@ -562,7 +648,10 @@ void ds4_cuda_launch_v50_direct_prepared_wmma_partial(
             prepared_k,
             prepared_v);
   } else {
-    ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel<false>
+    ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel<
+        false,
+        WarpSoftmax,
+        RowGroupPreparedK>
         <<<grid, block, 0, stream>>>(
             q,
             swa_cache,
@@ -592,3 +681,89 @@ void ds4_cuda_launch_v50_direct_prepared_wmma_partial(
             prepared_v);
   }
 }
+
+#define DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(NAME, WARP_SOFTMAX, ROWGROUP_K) \
+  void NAME(                                                              \
+      dim3 grid,                                                          \
+      dim3 block,                                                         \
+      cudaStream_t stream,                                                \
+      bool profile_stages,                                                \
+      const __nv_bfloat16* q,                                             \
+      const uint8_t* swa_cache,                                           \
+      const int32_t* swa_indices,                                         \
+      const int32_t* swa_lengths,                                         \
+      int swa_width,                                                      \
+      int swa_page_size,                                                  \
+      int swa_row_stride,                                                 \
+      const uint8_t* extra_cache,                                         \
+      const int32_t* extra_indices,                                       \
+      const int32_t* extra_lengths,                                       \
+      int extra_width,                                                    \
+      int extra_page_size,                                                \
+      int extra_row_stride,                                               \
+      bool has_extra,                                                     \
+      float softmax_scale,                                                \
+      int batch_size,                                                     \
+      int num_heads,                                                      \
+      int total_width,                                                    \
+      int head_tiles,                                                     \
+      int row_tiles,                                                      \
+      float* partial_max,                                                 \
+      float* partial_sum,                                                 \
+      __nv_bfloat16* partial_acc,                                         \
+      unsigned long long* profile_cycles,                                 \
+      const __nv_bfloat16* prepared_k,                                    \
+      const __nv_bfloat16* prepared_v) {                                  \
+    ds4_cuda_launch_direct_prepared_wmma_partial_variant<                 \
+        WARP_SOFTMAX,                                                     \
+        ROWGROUP_K>(                                                      \
+        grid,                                                             \
+        block,                                                            \
+        stream,                                                           \
+        profile_stages,                                                   \
+        q,                                                                \
+        swa_cache,                                                        \
+        swa_indices,                                                      \
+        swa_lengths,                                                      \
+        swa_width,                                                        \
+        swa_page_size,                                                    \
+        swa_row_stride,                                                   \
+        extra_cache,                                                      \
+        extra_indices,                                                    \
+        extra_lengths,                                                    \
+        extra_width,                                                      \
+        extra_page_size,                                                  \
+        extra_row_stride,                                                 \
+        has_extra,                                                        \
+        softmax_scale,                                                    \
+        batch_size,                                                       \
+        num_heads,                                                        \
+        total_width,                                                      \
+        head_tiles,                                                       \
+        row_tiles,                                                        \
+        partial_max,                                                      \
+        partial_sum,                                                      \
+        partial_acc,                                                      \
+        profile_cycles,                                                   \
+        prepared_k,                                                       \
+        prepared_v);                                                      \
+  }
+
+DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
+    ds4_cuda_launch_v50_direct_prepared_wmma_partial,
+    false,
+    false)
+DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
+    ds4_cuda_launch_v51_warp_softmax_direct_prepared_wmma_partial,
+    true,
+    false)
+DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
+    ds4_cuda_launch_v52_rowgroup_k_direct_prepared_wmma_partial,
+    false,
+    true)
+DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
+    ds4_cuda_launch_v53_warp_softmax_rowgroup_k_direct_prepared_wmma_partial,
+    true,
+    true)
+
+#undef DSV4_DEFINE_DIRECT_PREPARED_LAUNCH
