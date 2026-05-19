@@ -29,7 +29,7 @@ def _load_extension():
     os.environ.setdefault("MAX_JOBS", str(os.cpu_count() or 4))
 
     return load(
-        name="ds4_cuda_reference_attention_opt_v61_staged_v_ext",
+        name="ds4_cuda_reference_attention_opt_v62_stream_rows_ext",
         sources=[
             str(_HERE / "ds4_cuda_reference_attention.cpp"),
             str(_HERE / "ds4_cuda_reference_attention.cu"),
@@ -172,6 +172,12 @@ def _resolve_op(ext, optimized: bool | str | int):
         return ext.ds4_cuda_optimized_v60_attention
     if optimized == 65 or optimized in {"v61", "staged_v_colmajor_b_prepared_kv"}:
         return ext.ds4_cuda_optimized_v61_attention
+    if optimized == 66 or optimized in {"v62a", "v62", "stream2_v_colmajor_b_prepared_kv"}:
+        return ext.ds4_cuda_optimized_v62a_attention
+    if optimized == 67 or optimized in {"v62b", "stream4_v_colmajor_b_prepared_kv"}:
+        return ext.ds4_cuda_optimized_v62b_attention
+    if optimized == 68 or optimized in {"v62c", "stream2_staged_v_colmajor_b_prepared_kv"}:
+        return ext.ds4_cuda_optimized_v62c_attention
     raise ValueError(f"unknown DS4 CUDA attention variant: {optimized!r}")
 
 

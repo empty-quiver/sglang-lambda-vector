@@ -184,6 +184,10 @@ __device__ __forceinline__ const uint8_t* selected_combined_row_ptr(
 //   V as matrix_b col-major: [row_group, dim_slot, row_lane]
 //   Q/P as matrix_a col-major in shared: [dim/row, head]
 //   v61 stages each V row-group tile into shared before P@V WMMA.
+// v62a-v62c sweep row-tile online-softmax chunking on top of the v58b/v61
+// contracts. They use the first row tile's partial slot as a global-backed
+// running O accumulator and write neutral partials for the skipped row tiles so
+// the existing reduce kernel can be reused unchanged.
 //
 // QK consumes prepared_k directly as WMMA matrix_b row-major, or stages one
 // row-group K tile into shared memory for the v54 layout experiment. P@V
@@ -200,7 +204,8 @@ template <
     bool KColMajorB = false,
     bool VColMajorB = false,
     bool AColMajor = false,
-    bool StagedPreparedV = false>
+    bool StagedPreparedV = false,
+    int StreamRowTiles = 1>
 __global__ void __launch_bounds__(kV8Threads, 1)
 ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
     const __nv_bfloat16* __restrict__ q,
@@ -242,12 +247,14 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
   static_assert(
       !StagedPreparedV || VColMajorB,
       "staged prepared-V expects the V matrix-B col-major contract");
+  static_assert(
+      StreamRowTiles >= 1 && StreamRowTiles <= 4,
+      "DS4 v62 stream-row sweep supports 1, 2, or 4 row tiles");
 
   const int batch = blockIdx.x;
   const int head_tile = blockIdx.y;
-  const int row_tile = blockIdx.z;
+  const int row_tile_base = blockIdx.z * StreamRowTiles;
   const int head_base = head_tile * kScoreTileM;
-  const int tile_row_base = row_tile * kScoreRowsPerBlock;
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
   if (batch >= batch_size) {
@@ -272,6 +279,27 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
   __shared__ uint8_t row_valid[kScoreRowsPerBlock];
   __shared__ float tile_max_shared[kScoreTileM];
   __shared__ float tile_sum_shared[kScoreTileM];
+  __shared__ float running_max_shared[StreamRowTiles > 1 ? kScoreTileM : 1];
+  __shared__ float running_sum_shared[StreamRowTiles > 1 ? kScoreTileM : 1];
+  __shared__ float old_scale_shared[StreamRowTiles > 1 ? kScoreTileM : 1];
+  __shared__ float tile_scale_shared[StreamRowTiles > 1 ? kScoreTileM : 1];
+
+  if constexpr (StreamRowTiles > 1) {
+    if (threadIdx.x < kScoreTileM) {
+      running_max_shared[threadIdx.x] = -INFINITY;
+      running_sum_shared[threadIdx.x] = 0.0f;
+      old_scale_shared[threadIdx.x] = 0.0f;
+      tile_scale_shared[threadIdx.x] = 0.0f;
+    }
+    __syncthreads();
+  }
+
+  for (int stream_iter = 0; stream_iter < StreamRowTiles; ++stream_iter) {
+  const int row_tile = row_tile_base + stream_iter;
+  if (row_tile >= row_tiles) {
+    continue;
+  }
+  const int tile_row_base = row_tile * kScoreRowsPerBlock;
 
   if (threadIdx.x < kScoreTileM) {
     tile_max_shared[threadIdx.x] = -INFINITY;
@@ -603,13 +631,36 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
       if (lane == 0) {
         tile_max_shared[head_slot] = tile_max;
         tile_sum_shared[head_slot] = tile_sum;
-        const int64_t state_offset =
-            (((static_cast<int64_t>(batch) * head_tiles + head_tile) * row_tiles +
-              row_tile) *
-                 kScoreTileM +
-             head_slot);
-        partial_max[state_offset] = tile_max;
-        partial_sum[state_offset] = tile_sum;
+        if constexpr (StreamRowTiles == 1) {
+          const int64_t state_offset =
+              (((static_cast<int64_t>(batch) * head_tiles + head_tile) * row_tiles +
+                row_tile) *
+                   kScoreTileM +
+               head_slot);
+          partial_max[state_offset] = tile_max;
+          partial_sum[state_offset] = tile_sum;
+        } else {
+          const float old_l = running_sum_shared[head_slot];
+          const float old_m = running_max_shared[head_slot];
+          const bool has_tile = tile_sum > 0.0f;
+          const float new_m = has_tile ? fmaxf(old_m, tile_max) : old_m;
+          const float old_scale =
+              old_l > 0.0f ? expf(old_m - new_m) : 0.0f;
+          const float tile_scale = has_tile ? expf(tile_max - new_m) : 0.0f;
+          running_max_shared[head_slot] = new_m;
+          running_sum_shared[head_slot] = old_l * old_scale + tile_sum * tile_scale;
+          old_scale_shared[head_slot] = old_scale;
+          tile_scale_shared[head_slot] = tile_scale;
+          if (stream_iter > 0) {
+            const int64_t skipped_state_offset =
+                (((static_cast<int64_t>(batch) * head_tiles + head_tile) * row_tiles +
+                  row_tile) *
+                     kScoreTileM +
+                 head_slot);
+            partial_max[skipped_state_offset] = -INFINITY;
+            partial_sum[skipped_state_offset] = 0.0f;
+          }
+        }
       }
     }
   } else if (threadIdx.x < kScoreTileM) {
@@ -652,12 +703,35 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
     tile_max_shared[head_slot] = tile_max;
     tile_sum_shared[head_slot] = tile_sum;
 
-    const int64_t state_offset =
-        (((static_cast<int64_t>(batch) * head_tiles + head_tile) * row_tiles + row_tile) *
-             kScoreTileM +
-         head_slot);
-    partial_max[state_offset] = tile_max;
-    partial_sum[state_offset] = tile_sum;
+    if constexpr (StreamRowTiles == 1) {
+      const int64_t state_offset =
+          (((static_cast<int64_t>(batch) * head_tiles + head_tile) * row_tiles + row_tile) *
+               kScoreTileM +
+           head_slot);
+      partial_max[state_offset] = tile_max;
+      partial_sum[state_offset] = tile_sum;
+    } else {
+      const float old_l = running_sum_shared[head_slot];
+      const float old_m = running_max_shared[head_slot];
+      const bool has_tile = tile_sum > 0.0f;
+      const float new_m = has_tile ? fmaxf(old_m, tile_max) : old_m;
+      const float old_scale =
+          old_l > 0.0f ? expf(old_m - new_m) : 0.0f;
+      const float tile_scale = has_tile ? expf(tile_max - new_m) : 0.0f;
+      running_max_shared[head_slot] = new_m;
+      running_sum_shared[head_slot] = old_l * old_scale + tile_sum * tile_scale;
+      old_scale_shared[head_slot] = old_scale;
+      tile_scale_shared[head_slot] = tile_scale;
+      if (stream_iter > 0) {
+        const int64_t skipped_state_offset =
+            (((static_cast<int64_t>(batch) * head_tiles + head_tile) * row_tiles +
+              row_tile) *
+                 kScoreTileM +
+             head_slot);
+        partial_max[skipped_state_offset] = -INFINITY;
+        partial_sum[skipped_state_offset] = 0.0f;
+      }
+    }
   }
   __syncthreads();
   if (profile_this_block && threadIdx.x == 0) {
@@ -746,16 +820,41 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
         const int dim_slot = tile_idx - head_slot * kScoreTileN;
         const int head = head_base + head_slot;
         const int dim = dim_base + dim_slot;
-        const int64_t acc_offset =
-            ((((static_cast<int64_t>(batch) * head_tiles + head_tile) * row_tiles + row_tile) *
-                  kScoreTileM +
-              head_slot) *
-                 kHeadDim +
-             dim);
-        store_partial_acc(
-            partial_acc,
-            acc_offset,
-            head < num_heads ? score_shared[warp][tile_idx] : 0.0f);
+        const float tile_value =
+            head < num_heads ? score_shared[warp][tile_idx] : 0.0f;
+        if constexpr (StreamRowTiles == 1) {
+          const int64_t acc_offset =
+              ((((static_cast<int64_t>(batch) * head_tiles + head_tile) * row_tiles + row_tile) *
+                    kScoreTileM +
+                head_slot) *
+                   kHeadDim +
+               dim);
+          store_partial_acc(partial_acc, acc_offset, tile_value);
+        } else {
+          const int64_t first_acc_offset =
+              ((((static_cast<int64_t>(batch) * head_tiles + head_tile) * row_tiles +
+                 row_tile_base) *
+                    kScoreTileM +
+                head_slot) *
+                   kHeadDim +
+               dim);
+          const float old_value =
+              stream_iter == 0 ? 0.0f : __bfloat162float(partial_acc[first_acc_offset]);
+          const float combined_value =
+              old_scale_shared[head_slot] * old_value +
+              tile_scale_shared[head_slot] * tile_value;
+          store_partial_acc(partial_acc, first_acc_offset, combined_value);
+          if (stream_iter > 0) {
+            const int64_t skipped_acc_offset =
+                ((((static_cast<int64_t>(batch) * head_tiles + head_tile) * row_tiles +
+                   row_tile) *
+                      kScoreTileM +
+                  head_slot) *
+                     kHeadDim +
+                 dim);
+            store_partial_acc(partial_acc, skipped_acc_offset, 0.0f);
+          }
+        }
       }
     }
     __syncthreads();
@@ -774,6 +873,21 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
       profile_t0 = now;
     }
   }
+  }
+
+  if constexpr (StreamRowTiles > 1) {
+    __syncthreads();
+    if (threadIdx.x < kScoreTileM && row_tile_base < row_tiles) {
+      const int head_slot = threadIdx.x;
+      const int64_t state_offset =
+          (((static_cast<int64_t>(batch) * head_tiles + head_tile) * row_tiles +
+            row_tile_base) *
+               kScoreTileM +
+           head_slot);
+      partial_max[state_offset] = running_max_shared[head_slot];
+      partial_sum[state_offset] = running_sum_shared[head_slot];
+    }
+  }
 }
 
 }  // namespace
@@ -786,7 +900,8 @@ template <
     bool KColMajorB,
     bool VColMajorB,
     bool AColMajor,
-    bool StagedPreparedV = false>
+    bool StagedPreparedV = false,
+    int StreamRowTiles = 1>
 void ds4_cuda_launch_direct_prepared_wmma_partial_variant(
     dim3 grid,
     dim3 block,
@@ -818,6 +933,11 @@ void ds4_cuda_launch_direct_prepared_wmma_partial_variant(
     unsigned long long* profile_cycles,
     const __nv_bfloat16* prepared_k,
     const __nv_bfloat16* prepared_v) {
+  dim3 launch_grid = grid;
+  if constexpr (StreamRowTiles > 1) {
+    launch_grid.z =
+        static_cast<unsigned int>((row_tiles + StreamRowTiles - 1) / StreamRowTiles);
+  }
   if (profile_stages) {
     ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel<
         true,
@@ -828,8 +948,9 @@ void ds4_cuda_launch_direct_prepared_wmma_partial_variant(
         KColMajorB,
         VColMajorB,
         AColMajor,
-        StagedPreparedV>
-        <<<grid, block, 0, stream>>>(
+        StagedPreparedV,
+        StreamRowTiles>
+        <<<launch_grid, block, 0, stream>>>(
             q,
             swa_cache,
             swa_indices,
@@ -866,8 +987,9 @@ void ds4_cuda_launch_direct_prepared_wmma_partial_variant(
         KColMajorB,
         VColMajorB,
         AColMajor,
-        StagedPreparedV>
-        <<<grid, block, 0, stream>>>(
+        StagedPreparedV,
+        StreamRowTiles>
+        <<<launch_grid, block, 0, stream>>>(
             q,
             swa_cache,
             swa_indices,
@@ -899,7 +1021,7 @@ void ds4_cuda_launch_direct_prepared_wmma_partial_variant(
 
 #define DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(                              \
     NAME, WARP_SOFTMAX, ROWGROUP_K, STAGED_K, DIM_SPLIT_QK, K_COL_B,     \
-    V_COL_B, A_COL, STAGED_V)                                             \
+    V_COL_B, A_COL, STAGED_V, STREAM_ROW_TILES)                           \
   void NAME(                                                              \
       dim3 grid,                                                          \
       dim3 block,                                                         \
@@ -939,7 +1061,8 @@ void ds4_cuda_launch_direct_prepared_wmma_partial_variant(
         K_COL_B,                                                           \
         V_COL_B,                                                           \
         A_COL,                                                             \
-        STAGED_V>(                                                         \
+        STAGED_V,                                                          \
+        STREAM_ROW_TILES>(                                                 \
         grid,                                                             \
         block,                                                            \
         stream,                                                           \
@@ -981,7 +1104,8 @@ DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     false,
     false,
     false,
-    false)
+    false,
+    1)
 DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     ds4_cuda_launch_v51_warp_softmax_direct_prepared_wmma_partial,
     true,
@@ -991,7 +1115,8 @@ DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     false,
     false,
     false,
-    false)
+    false,
+    1)
 DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     ds4_cuda_launch_v52_rowgroup_k_direct_prepared_wmma_partial,
     false,
@@ -1001,7 +1126,8 @@ DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     false,
     false,
     false,
-    false)
+    false,
+    1)
 DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     ds4_cuda_launch_v53_warp_softmax_rowgroup_k_direct_prepared_wmma_partial,
     true,
@@ -1011,7 +1137,8 @@ DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     false,
     false,
     false,
-    false)
+    false,
+    1)
 DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     ds4_cuda_launch_v54_staged_k_warp_softmax_rowgroup_direct_prepared_wmma_partial,
     true,
@@ -1021,7 +1148,8 @@ DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     false,
     false,
     false,
-    false)
+    false,
+    1)
 DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     ds4_cuda_launch_v55_dimsplit_qk_warp_softmax_rowgroup_direct_prepared_wmma_partial,
     true,
@@ -1031,7 +1159,8 @@ DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     false,
     false,
     false,
-    false)
+    false,
+    1)
 DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     ds4_cuda_launch_v58a_k_colmajor_b_direct_prepared_wmma_partial,
     true,
@@ -1041,7 +1170,8 @@ DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     true,
     false,
     false,
-    false)
+    false,
+    1)
 DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     ds4_cuda_launch_v58b_v_colmajor_b_direct_prepared_wmma_partial,
     true,
@@ -1051,7 +1181,8 @@ DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     false,
     true,
     false,
-    false)
+    false,
+    1)
 DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     ds4_cuda_launch_v58_kv_colmajor_b_direct_prepared_wmma_partial,
     true,
@@ -1061,7 +1192,8 @@ DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     true,
     true,
     false,
-    false)
+    false,
+    1)
 DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     ds4_cuda_launch_v59_a_colmajor_direct_prepared_wmma_partial,
     true,
@@ -1071,7 +1203,8 @@ DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     false,
     false,
     true,
-    false)
+    false,
+    1)
 DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     ds4_cuda_launch_v60_ab_colmajor_direct_prepared_wmma_partial,
     true,
@@ -1081,7 +1214,8 @@ DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     true,
     true,
     true,
-    false)
+    false,
+    1)
 DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     ds4_cuda_launch_v61_staged_v_colmajor_b_direct_prepared_wmma_partial,
     true,
@@ -1091,6 +1225,41 @@ DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     false,
     true,
     false,
-    true)
+    true,
+    1)
+
+DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
+    ds4_cuda_launch_v62a_stream2_v_colmajor_b_direct_prepared_wmma_partial,
+    true,
+    true,
+    false,
+    false,
+    false,
+    true,
+    false,
+    false,
+    2)
+DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
+    ds4_cuda_launch_v62b_stream4_v_colmajor_b_direct_prepared_wmma_partial,
+    true,
+    true,
+    false,
+    false,
+    false,
+    true,
+    false,
+    false,
+    4)
+DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
+    ds4_cuda_launch_v62c_stream2_staged_v_colmajor_b_direct_prepared_wmma_partial,
+    true,
+    true,
+    false,
+    false,
+    false,
+    true,
+    false,
+    true,
+    2)
 
 #undef DSV4_DEFINE_DIRECT_PREPARED_LAUNCH

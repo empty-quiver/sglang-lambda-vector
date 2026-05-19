@@ -787,6 +787,9 @@ DSV4_DECLARE_OPTIMIZED_ATTENTION(ds4_cuda_optimized_v58_attention)
 DSV4_DECLARE_OPTIMIZED_ATTENTION(ds4_cuda_optimized_v59_attention)
 DSV4_DECLARE_OPTIMIZED_ATTENTION(ds4_cuda_optimized_v60_attention)
 DSV4_DECLARE_OPTIMIZED_ATTENTION(ds4_cuda_optimized_v61_attention)
+DSV4_DECLARE_OPTIMIZED_ATTENTION(ds4_cuda_optimized_v62a_attention)
+DSV4_DECLARE_OPTIMIZED_ATTENTION(ds4_cuda_optimized_v62b_attention)
+DSV4_DECLARE_OPTIMIZED_ATTENTION(ds4_cuda_optimized_v62c_attention)
 
 #undef DSV4_DECLARE_OPTIMIZED_ATTENTION
 
@@ -1075,6 +1078,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "ds4_cuda_optimized_v61_attention",
       &ds4_cuda_optimized_v61_attention,
       "Debug CUDA DS4 sparse attention optimized v61 staged V matrix-B col-major contract");
+  m.def(
+      "ds4_cuda_optimized_v62a_attention",
+      &ds4_cuda_optimized_v62a_attention,
+      "Debug CUDA DS4 sparse attention optimized v62a stream-2 row-tile online V matrix-B contract");
+  m.def(
+      "ds4_cuda_optimized_v62b_attention",
+      &ds4_cuda_optimized_v62b_attention,
+      "Debug CUDA DS4 sparse attention optimized v62b stream-4 row-tile online V matrix-B contract");
+  m.def(
+      "ds4_cuda_optimized_v62c_attention",
+      &ds4_cuda_optimized_v62c_attention,
+      "Debug CUDA DS4 sparse attention optimized v62c stream-2 row-tile online staged V contract");
   m.def(
       "ds4_cuda_reference_scores",
       &ds4_cuda_reference_scores,
