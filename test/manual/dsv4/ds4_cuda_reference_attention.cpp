@@ -786,6 +786,7 @@ DSV4_DECLARE_OPTIMIZED_ATTENTION(ds4_cuda_optimized_v58b_attention)
 DSV4_DECLARE_OPTIMIZED_ATTENTION(ds4_cuda_optimized_v58_attention)
 DSV4_DECLARE_OPTIMIZED_ATTENTION(ds4_cuda_optimized_v59_attention)
 DSV4_DECLARE_OPTIMIZED_ATTENTION(ds4_cuda_optimized_v60_attention)
+DSV4_DECLARE_OPTIMIZED_ATTENTION(ds4_cuda_optimized_v61_attention)
 
 #undef DSV4_DECLARE_OPTIMIZED_ATTENTION
 
@@ -1070,6 +1071,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "ds4_cuda_optimized_v60_attention",
       &ds4_cuda_optimized_v60_attention,
       "Debug CUDA DS4 sparse attention optimized v60 combined A/B col-major fragment contract");
+  m.def(
+      "ds4_cuda_optimized_v61_attention",
+      &ds4_cuda_optimized_v61_attention,
+      "Debug CUDA DS4 sparse attention optimized v61 staged V matrix-B col-major contract");
   m.def(
       "ds4_cuda_reference_scores",
       &ds4_cuda_reference_scores,

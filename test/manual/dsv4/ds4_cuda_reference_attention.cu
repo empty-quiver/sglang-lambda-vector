@@ -246,6 +246,8 @@ DSV4_DECLARE_DIRECT_PREPARED_LAUNCH(
     ds4_cuda_launch_v59_a_colmajor_direct_prepared_wmma_partial)
 DSV4_DECLARE_DIRECT_PREPARED_LAUNCH(
     ds4_cuda_launch_v60_ab_colmajor_direct_prepared_wmma_partial)
+DSV4_DECLARE_DIRECT_PREPARED_LAUNCH(
+    ds4_cuda_launch_v61_staged_v_colmajor_b_direct_prepared_wmma_partial)
 
 #undef DSV4_DECLARE_DIRECT_PREPARED_LAUNCH
 
@@ -486,6 +488,7 @@ enum class AttentionVariant : int {
   kOptimizedV58 = 62,
   kOptimizedV59 = 63,
   kOptimizedV60 = 64,
+  kOptimizedV61 = 65,
 };
 
 const char* attention_variant_name(AttentionVariant variant) {
@@ -618,6 +621,8 @@ const char* attention_variant_name(AttentionVariant variant) {
       return "v59";
     case AttentionVariant::kOptimizedV60:
       return "v60";
+    case AttentionVariant::kOptimizedV61:
+      return "v61";
   }
   return "unknown";
 }
@@ -8860,7 +8865,8 @@ torch::Tensor launch_ds4_cuda_attention(
       variant == AttentionVariant::kOptimizedV58B ||
       variant == AttentionVariant::kOptimizedV58 ||
       variant == AttentionVariant::kOptimizedV59 ||
-      variant == AttentionVariant::kOptimizedV60) {
+      variant == AttentionVariant::kOptimizedV60 ||
+      variant == AttentionVariant::kOptimizedV61) {
     const bool common_cr4_path =
         has_extra &&
         num_heads == 64 &&
@@ -9167,7 +9173,8 @@ torch::Tensor launch_ds4_cuda_attention(
     case AttentionVariant::kOptimizedV58B:
     case AttentionVariant::kOptimizedV58:
     case AttentionVariant::kOptimizedV59:
-    case AttentionVariant::kOptimizedV60: {
+    case AttentionVariant::kOptimizedV60:
+    case AttentionVariant::kOptimizedV61: {
       const bool cache_scales = variant != AttentionVariant::kOptimizedV8;
       const bool tensor_core_pv = variant == AttentionVariant::kOptimizedV10;
       const bool tensor_core_pv_parallel = variant == AttentionVariant::kOptimizedV11;
@@ -9189,7 +9196,8 @@ torch::Tensor launch_ds4_cuda_attention(
           variant == AttentionVariant::kOptimizedV58B ||
           variant == AttentionVariant::kOptimizedV58 ||
           variant == AttentionVariant::kOptimizedV59 ||
-          variant == AttentionVariant::kOptimizedV60;
+          variant == AttentionVariant::kOptimizedV60 ||
+          variant == AttentionVariant::kOptimizedV61;
       const bool tensor_core_pv_rowgroup_accum =
           variant == AttentionVariant::kOptimizedV15 ||
           variant == AttentionVariant::kOptimizedV16 ||
@@ -9275,7 +9283,8 @@ torch::Tensor launch_ds4_cuda_attention(
           variant == AttentionVariant::kOptimizedV58B ||
           variant == AttentionVariant::kOptimizedV58 ||
           variant == AttentionVariant::kOptimizedV59 ||
-          variant == AttentionVariant::kOptimizedV60;
+          variant == AttentionVariant::kOptimizedV60 ||
+          variant == AttentionVariant::kOptimizedV61;
       const bool tensor_core_pv_prepared_kv_direct_p =
           variant == AttentionVariant::kOptimizedV45 ||
           variant == AttentionVariant::kOptimizedV49A ||
@@ -9315,11 +9324,14 @@ torch::Tensor launch_ds4_cuda_attention(
           variant == AttentionVariant::kOptimizedV59;
       const bool tensor_core_pv_v60_ab_colmajor_direct_prepared_wmma =
           variant == AttentionVariant::kOptimizedV60;
+      const bool tensor_core_pv_v61_staged_v_colmajor_b_direct_prepared_wmma =
+          variant == AttentionVariant::kOptimizedV61;
       const bool tensor_core_pv_v58_layout_prepared_kv_producer =
           tensor_core_pv_v58a_k_colmajor_b_direct_prepared_wmma ||
           tensor_core_pv_v58b_v_colmajor_b_direct_prepared_wmma ||
           tensor_core_pv_v58_kv_colmajor_b_direct_prepared_wmma ||
-          tensor_core_pv_v60_ab_colmajor_direct_prepared_wmma;
+          tensor_core_pv_v60_ab_colmajor_direct_prepared_wmma ||
+          tensor_core_pv_v61_staged_v_colmajor_b_direct_prepared_wmma;
       const bool tensor_core_pv_prepared_p_split =
           variant == AttentionVariant::kOptimizedV48;
       const bool tensor_core_pv_grouped_head_k_reuse =
@@ -9592,7 +9604,9 @@ torch::Tensor launch_ds4_cuda_attention(
           reinterpret_cast<__nv_bfloat16*>(prepared_v.data_ptr<at::BFloat16>()))
           if (tensor_core_pv_v58a_k_colmajor_b_direct_prepared_wmma) {
             DSV4_LAUNCH_COMMON_SINGLE_SCALE_LAYOUT(true, false);
-          } else if (tensor_core_pv_v58b_v_colmajor_b_direct_prepared_wmma) {
+          } else if (
+              tensor_core_pv_v58b_v_colmajor_b_direct_prepared_wmma ||
+              tensor_core_pv_v61_staged_v_colmajor_b_direct_prepared_wmma) {
             DSV4_LAUNCH_COMMON_SINGLE_SCALE_LAYOUT(false, true);
           } else {
             DSV4_LAUNCH_COMMON_SINGLE_SCALE_LAYOUT(true, true);
@@ -10619,7 +10633,8 @@ torch::Tensor launch_ds4_cuda_attention(
                 tensor_core_pv_v58b_v_colmajor_b_direct_prepared_wmma ||
                 tensor_core_pv_v58_kv_colmajor_b_direct_prepared_wmma ||
                 tensor_core_pv_v59_a_colmajor_direct_prepared_wmma ||
-                tensor_core_pv_v60_ab_colmajor_direct_prepared_wmma) {
+                tensor_core_pv_v60_ab_colmajor_direct_prepared_wmma ||
+                tensor_core_pv_v61_staged_v_colmajor_b_direct_prepared_wmma) {
               auto launch_standalone_direct_prepared =
                   ds4_cuda_launch_v50_direct_prepared_wmma_partial;
               if (tensor_core_pv_v52_rowgroup_k_direct_prepared_wmma) {
@@ -10661,6 +10676,10 @@ torch::Tensor launch_ds4_cuda_attention(
               if (tensor_core_pv_v60_ab_colmajor_direct_prepared_wmma) {
                 launch_standalone_direct_prepared =
                     ds4_cuda_launch_v60_ab_colmajor_direct_prepared_wmma_partial;
+              }
+              if (tensor_core_pv_v61_staged_v_colmajor_b_direct_prepared_wmma) {
+                launch_standalone_direct_prepared =
+                    ds4_cuda_launch_v61_staged_v_colmajor_b_direct_prepared_wmma_partial;
               }
               launch_standalone_direct_prepared(
                   split_grid,
@@ -13737,6 +13756,9 @@ DSV4_DEFINE_OPTIMIZED_WRAPPER(
 DSV4_DEFINE_OPTIMIZED_WRAPPER(
     ds4_cuda_optimized_v60_attention,
     AttentionVariant::kOptimizedV60)
+DSV4_DEFINE_OPTIMIZED_WRAPPER(
+    ds4_cuda_optimized_v61_attention,
+    AttentionVariant::kOptimizedV61)
 
 #undef DSV4_DEFINE_OPTIMIZED_WRAPPER
 
