@@ -77,6 +77,7 @@ OPTIMIZED_VARIANTS = (
     "v31",
     "v32",
     "v33",
+    "v34",
 )
 
 
