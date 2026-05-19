@@ -227,6 +227,9 @@ enum class AttentionVariant : int {
   kOptimizedV46 = 46,
   kOptimizedV47 = 47,
   kOptimizedV48 = 48,
+  kOptimizedV49A = 49,
+  kOptimizedV49B = 50,
+  kOptimizedV49 = 51,
 };
 
 const char* attention_variant_name(AttentionVariant variant) {
@@ -327,6 +330,12 @@ const char* attention_variant_name(AttentionVariant variant) {
       return "v47";
     case AttentionVariant::kOptimizedV48:
       return "v48";
+    case AttentionVariant::kOptimizedV49A:
+      return "v49a";
+    case AttentionVariant::kOptimizedV49B:
+      return "v49b";
+    case AttentionVariant::kOptimizedV49:
+      return "v49";
   }
   return "unknown";
 }
@@ -3291,17 +3300,24 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
   constexpr bool kV44Row32 = PVMmaMode == 16;
   constexpr bool kDirectPCache =
       PVMmaMode == 16 || PVMmaMode == 17 || PVMmaMode == 18 ||
-      PVMmaMode == 19;
+      PVMmaMode == 19 || PVMmaMode == 20 || PVMmaMode == 21 ||
+      PVMmaMode == 22;
   constexpr bool kPreparedKVMode =
       PVMmaMode == 15 || PVMmaMode == 16 || PVMmaMode == 17 ||
-      PVMmaMode == 18 || PVMmaMode == 19;
+      PVMmaMode == 18 || PVMmaMode == 19 || PVMmaMode == 20 ||
+      PVMmaMode == 21 || PVMmaMode == 22;
+  constexpr bool kDirectPreparedKLoad =
+      PVMmaMode == 20 || PVMmaMode == 22;
+  constexpr bool kDirectPreparedVLoad =
+      PVMmaMode == 21 || PVMmaMode == 22;
   constexpr bool kRollingQReuseMode = PVMmaMode == 18;
   constexpr bool kHalfPvWarpMode = PVMmaMode == 19;
   constexpr bool kFullQReuseMode =
       PVMmaMode == 7 || PVMmaMode == 8 || PVMmaMode == 9 ||
       PVMmaMode == 10 || PVMmaMode == 11 || PVMmaMode == 12 ||
       PVMmaMode == 13 || PVMmaMode == 14 || PVMmaMode == 15 ||
-      PVMmaMode == 17 || PVMmaMode == 19;
+      PVMmaMode == 17 || PVMmaMode == 19 || PVMmaMode == 20 ||
+      PVMmaMode == 21 || PVMmaMode == 22;
   constexpr bool kQReuseMode = kFullQReuseMode || kRollingQReuseMode;
   constexpr int kPartialScoreWarps =
       kV44Row32 ? kV44ScoreWarpsPerBlock : kScoreWarpsPerBlock;
@@ -3328,7 +3344,8 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
        PVMmaMode == 9 || PVMmaMode == 10 || PVMmaMode == 11 ||
        PVMmaMode == 12 || PVMmaMode == 13 || PVMmaMode == 14 ||
        PVMmaMode == 15 || PVMmaMode == 16 || PVMmaMode == 17 ||
-       PVMmaMode == 18 || PVMmaMode == 19);
+       PVMmaMode == 18 || PVMmaMode == 19 || PVMmaMode == 20 ||
+       PVMmaMode == 21 || PVMmaMode == 22);
   unsigned long long profile_t0 = 0;
   if (profile_this_block && threadIdx.x == 0) {
     profile_t0 = clock64();
@@ -3496,7 +3513,8 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
                     PVMmaMode == 12 || PVMmaMode == 13 || PVMmaMode == 14 ||
                     PVMmaMode == 15 || PVMmaMode == 16 ||
                     PVMmaMode == 17 || PVMmaMode == 18 ||
-                    PVMmaMode == 19) {
+                    PVMmaMode == 19 || PVMmaMode == 20 ||
+                    PVMmaMode == 21 || PVMmaMode == 22) {
         if constexpr (PVMmaMode == 16) {
           unsigned long long q_thread_t0 = 0;
           if (profile_this_block && threadIdx.x == 0) {
@@ -3521,69 +3539,75 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
         if (profile_this_block && threadIdx.x == 0) {
           k_thread_t0 = clock64();
         }
-        const int k_row_slot = lane & (kScoreTileN - 1);
-        const int first_dim_slot = lane >> 4;
-        const int local_row = warp_row_base + k_row_slot;
-        const bool valid = row_valid[local_row] != 0;
-        const uint8_t* packed = row_ptrs[local_row];
-        if (dim_base < kNopeDim) {
-          const int scale_slot = dim_base / kScaleGroup;
+        if constexpr (!kDirectPreparedKLoad) {
+          const int k_row_slot = lane & (kScoreTileN - 1);
+          const int first_dim_slot = lane >> 4;
+          const int local_row = warp_row_base + k_row_slot;
+          const bool valid = row_valid[local_row] != 0;
+          const uint8_t* packed = row_ptrs[local_row];
+          if (dim_base < kNopeDim) {
+            const int scale_slot = dim_base / kScaleGroup;
 #pragma unroll
-          for (int k_dim_slot = first_dim_slot; k_dim_slot < kScoreTileK;
-               k_dim_slot += 2) {
-            const int dim = dim_base + k_dim_slot;
-            const int shared_idx = k_dim_slot * kScoreTileN + k_row_slot;
-            if constexpr (PVMmaMode == 14 || PVMmaMode == 15 ||
-                          PVMmaMode == 16 || PVMmaMode == 17 ||
-                          PVMmaMode == 18 || PVMmaMode == 19) {
-              const int prepared_idx = k_dim_slot * kPartialRowsPerBlock + local_row;
-              const int64_t prepared_offset =
-                  (((static_cast<int64_t>(batch) * row_tiles + row_tile) *
-                        kScoreKTileCount +
-                    (dim_base / kScoreTileK)) *
-                       kPartialPreparedKTileElems +
-                   prepared_idx);
-              k_shared[warp][shared_idx] = prepared_k[prepared_offset];
-            } else if constexpr (PVMmaMode == 12) {
-              k_shared[warp][shared_idx] =
-                  valid ? scaled_fp8_e4m3fn_to_bfloat16(
-                              packed[dim], row_scale_bytes[local_row][scale_slot])
-                        : __float2bfloat16(0.0f);
-            } else if constexpr (PVMmaMode == 13) {
-              k_shared[warp][shared_idx] =
-                  valid ? approx_scaled_fp8_e4m3fn_to_bfloat16(
-                              packed[dim], row_scale_bytes[local_row][scale_slot])
-                        : __float2bfloat16(0.0f);
-            } else {
-              const float scale =
-                  (valid && CacheScales) ? row_scales[local_row][scale_slot] : 1.0f;
-              const float decoded =
-                  valid ? fp8_e4m3fn_to_float(packed[dim]) * scale : 0.0f;
-              k_shared[warp][shared_idx] = __float2bfloat16(decoded);
+            for (int k_dim_slot = first_dim_slot; k_dim_slot < kScoreTileK;
+                 k_dim_slot += 2) {
+              const int dim = dim_base + k_dim_slot;
+              const int shared_idx = k_dim_slot * kScoreTileN + k_row_slot;
+              if constexpr (PVMmaMode == 14 || PVMmaMode == 15 ||
+                            PVMmaMode == 16 || PVMmaMode == 17 ||
+                            PVMmaMode == 18 || PVMmaMode == 19 ||
+                            PVMmaMode == 20 || PVMmaMode == 21 ||
+                            PVMmaMode == 22) {
+                const int prepared_idx = k_dim_slot * kPartialRowsPerBlock + local_row;
+                const int64_t prepared_offset =
+                    (((static_cast<int64_t>(batch) * row_tiles + row_tile) *
+                          kScoreKTileCount +
+                      (dim_base / kScoreTileK)) *
+                         kPartialPreparedKTileElems +
+                     prepared_idx);
+                k_shared[warp][shared_idx] = prepared_k[prepared_offset];
+              } else if constexpr (PVMmaMode == 12) {
+                k_shared[warp][shared_idx] =
+                    valid ? scaled_fp8_e4m3fn_to_bfloat16(
+                                packed[dim], row_scale_bytes[local_row][scale_slot])
+                          : __float2bfloat16(0.0f);
+              } else if constexpr (PVMmaMode == 13) {
+                k_shared[warp][shared_idx] =
+                    valid ? approx_scaled_fp8_e4m3fn_to_bfloat16(
+                                packed[dim], row_scale_bytes[local_row][scale_slot])
+                          : __float2bfloat16(0.0f);
+              } else {
+                const float scale =
+                    (valid && CacheScales) ? row_scales[local_row][scale_slot] : 1.0f;
+                const float decoded =
+                    valid ? fp8_e4m3fn_to_float(packed[dim]) * scale : 0.0f;
+                k_shared[warp][shared_idx] = __float2bfloat16(decoded);
+              }
             }
-          }
-        } else {
+          } else {
 #pragma unroll
-          for (int k_dim_slot = first_dim_slot; k_dim_slot < kScoreTileK;
-               k_dim_slot += 2) {
-            const int dim = dim_base + k_dim_slot;
-            const int shared_idx = k_dim_slot * kScoreTileN + k_row_slot;
-            if constexpr (PVMmaMode == 14 || PVMmaMode == 15 ||
-                          PVMmaMode == 16 || PVMmaMode == 17 ||
-                          PVMmaMode == 18 || PVMmaMode == 19) {
-              const int prepared_idx = k_dim_slot * kPartialRowsPerBlock + local_row;
-              const int64_t prepared_offset =
-                  (((static_cast<int64_t>(batch) * row_tiles + row_tile) *
-                        kScoreKTileCount +
-                    (dim_base / kScoreTileK)) *
-                       kPartialPreparedKTileElems +
-                   prepared_idx);
-              k_shared[warp][shared_idx] = prepared_k[prepared_offset];
-            } else {
-              k_shared[warp][shared_idx] =
-                  valid ? bf16_bytes_to_bfloat16(
-                              packed + kNopeDim + (dim - kNopeDim) * 2)
-                        : __float2bfloat16(0.0f);
+            for (int k_dim_slot = first_dim_slot; k_dim_slot < kScoreTileK;
+                 k_dim_slot += 2) {
+              const int dim = dim_base + k_dim_slot;
+              const int shared_idx = k_dim_slot * kScoreTileN + k_row_slot;
+              if constexpr (PVMmaMode == 14 || PVMmaMode == 15 ||
+                            PVMmaMode == 16 || PVMmaMode == 17 ||
+                            PVMmaMode == 18 || PVMmaMode == 19 ||
+                            PVMmaMode == 20 || PVMmaMode == 21 ||
+                            PVMmaMode == 22) {
+                const int prepared_idx = k_dim_slot * kPartialRowsPerBlock + local_row;
+                const int64_t prepared_offset =
+                    (((static_cast<int64_t>(batch) * row_tiles + row_tile) *
+                          kScoreKTileCount +
+                      (dim_base / kScoreTileK)) *
+                         kPartialPreparedKTileElems +
+                     prepared_idx);
+                k_shared[warp][shared_idx] = prepared_k[prepared_offset];
+              } else {
+                k_shared[warp][shared_idx] =
+                    valid ? bf16_bytes_to_bfloat16(
+                                packed + kNopeDim + (dim - kNopeDim) * 2)
+                          : __float2bfloat16(0.0f);
+              }
             }
           }
         }
@@ -3710,7 +3734,16 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
       } else {
         wmma::load_matrix_sync(q_frag, q_shared[warp], kScoreTileK);
       }
-      if constexpr (PVMmaMode == 8) {
+      if constexpr (kDirectPreparedKLoad) {
+        const int64_t prepared_base =
+            (((static_cast<int64_t>(batch) * row_tiles + row_tile) *
+                  kScoreKTileCount +
+              (dim_base / kScoreTileK)) *
+             kPartialPreparedKTileElems);
+        wmma::load_matrix_sync(
+            k_frag, prepared_k + prepared_base + warp_row_base, kPartialRowsPerBlock);
+        wmma::mma_sync(acc_frag, q_frag, k_frag, acc_frag);
+      } else if constexpr (PVMmaMode == 8) {
         wmma::load_matrix_sync(k_frag_col, k_shared[warp], kScoreTileK);
         wmma::mma_sync(acc_frag, q_frag, k_frag_col, acc_frag);
       } else {
@@ -4033,8 +4066,9 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
                 PVMmaMode == 8 || PVMmaMode == 9 || PVMmaMode == 10 ||
                 PVMmaMode == 11 || PVMmaMode == 12 || PVMmaMode == 13 ||
                 PVMmaMode == 14 || PVMmaMode == 15 || PVMmaMode == 16 ||
-                PVMmaMode == 17 || PVMmaMode == 18 || PVMmaMode == 19) {
-    // Experimental v15/v16/v17/v27/v38/v39/v40/v41/v42/v43/v44/v45/v46/v47 path: keep v14's cached-P, BF16 partial accumulator,
+                PVMmaMode == 17 || PVMmaMode == 18 || PVMmaMode == 19 ||
+                PVMmaMode == 20 || PVMmaMode == 21 || PVMmaMode == 22) {
+    // Experimental v15/v16/v17/v27/v38/v39/v40/v41/v42/v43/v44/v45/v46/v47/v49 path: keep v14's cached-P, BF16 partial accumulator,
     // and specialized V decode, but remove the explicit shared-memory
     // row-group reduction. Each P@V warp accumulates all 16-row groups into
     // one WMMA accumulator for one output dim tile. Most modes use 16 P@V
@@ -4081,48 +4115,50 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
         }
 #pragma unroll
         for (int row_group = 0; row_group < kPartialScoreWarps; ++row_group) {
-          for (int idx = lane; idx < kScoreTileElems; idx += 32) {
-            const int k_slot = idx / kScoreTileN;
-            const int dim_slot = idx - k_slot * kScoreTileN;
-            const int row_slot = row_group * kScoreTileN + k_slot;
-            const int dim = dim_base + dim_slot;
-            if constexpr (kPreparedKVMode) {
-              const int prepared_idx = row_slot * kScoreTileK + dim_slot;
-              const int64_t prepared_offset =
-                  (((static_cast<int64_t>(batch) * row_tiles + row_tile) *
-                        kScoreKTileCount +
-                    (dim_base / kScoreTileK)) *
-                       kPartialPreparedVTileElems +
-                   prepared_idx);
-              k_shared[warp][idx] = prepared_v[prepared_offset];
-              continue;
-            }
-            float v = 0.0f;
-            if (row_valid[row_slot]) {
-              const uint8_t* row = row_ptrs[row_slot];
-              if constexpr (CacheScales) {
-                if (nope_tile) {
-                  if constexpr (PVMmaMode == 12) {
-                    k_shared[warp][idx] = scaled_fp8_e4m3fn_to_bfloat16(
-                        row[dim], row_scale_bytes[row_slot][scale_slot]);
-                    continue;
-                  } else if constexpr (PVMmaMode == 13) {
-                    k_shared[warp][idx] = approx_scaled_fp8_e4m3fn_to_bfloat16(
-                        row[dim], row_scale_bytes[row_slot][scale_slot]);
-                    continue;
+          if constexpr (!kDirectPreparedVLoad) {
+            for (int idx = lane; idx < kScoreTileElems; idx += 32) {
+              const int k_slot = idx / kScoreTileN;
+              const int dim_slot = idx - k_slot * kScoreTileN;
+              const int row_slot = row_group * kScoreTileN + k_slot;
+              const int dim = dim_base + dim_slot;
+              if constexpr (kPreparedKVMode) {
+                const int prepared_idx = row_slot * kScoreTileK + dim_slot;
+                const int64_t prepared_offset =
+                    (((static_cast<int64_t>(batch) * row_tiles + row_tile) *
+                          kScoreKTileCount +
+                      (dim_base / kScoreTileK)) *
+                         kPartialPreparedVTileElems +
+                     prepared_idx);
+                k_shared[warp][idx] = prepared_v[prepared_offset];
+                continue;
+              }
+              float v = 0.0f;
+              if (row_valid[row_slot]) {
+                const uint8_t* row = row_ptrs[row_slot];
+                if constexpr (CacheScales) {
+                  if (nope_tile) {
+                    if constexpr (PVMmaMode == 12) {
+                      k_shared[warp][idx] = scaled_fp8_e4m3fn_to_bfloat16(
+                          row[dim], row_scale_bytes[row_slot][scale_slot]);
+                      continue;
+                    } else if constexpr (PVMmaMode == 13) {
+                      k_shared[warp][idx] = approx_scaled_fp8_e4m3fn_to_bfloat16(
+                          row[dim], row_scale_bytes[row_slot][scale_slot]);
+                      continue;
+                    } else {
+                      v = fp8_e4m3fn_to_float(row[dim]) * row_scales[row_slot][scale_slot];
+                    }
                   } else {
-                    v = fp8_e4m3fn_to_float(row[dim]) * row_scales[row_slot][scale_slot];
+                    v = bf16_bytes_to_float(row + kNopeDim + (dim - kNopeDim) * 2);
                   }
                 } else {
-                  v = bf16_bytes_to_float(row + kNopeDim + (dim - kNopeDim) * 2);
+                  v = load_dsv4_packed_dim(row, dim);
                 }
-              } else {
-                v = load_dsv4_packed_dim(row, dim);
               }
+              k_shared[warp][idx] = __float2bfloat16(v);
             }
-            k_shared[warp][idx] = __float2bfloat16(v);
+            __syncwarp();
           }
-          __syncwarp();
 
           if constexpr (PVMmaMode == 11) {
             uint32_t p_regs[4];
@@ -4139,7 +4175,19 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
             } else {
               wmma::load_matrix_sync(p_frag, q_shared[row_group], kScoreTileN);
             }
-            wmma::load_matrix_sync(v_frag, k_shared[warp], kScoreTileN);
+            if constexpr (kDirectPreparedVLoad) {
+              const int64_t prepared_base =
+                  (((static_cast<int64_t>(batch) * row_tiles + row_tile) *
+                        kScoreKTileCount +
+                    (dim_base / kScoreTileK)) *
+                   kPartialPreparedVTileElems);
+              wmma::load_matrix_sync(
+                  v_frag,
+                  prepared_v + prepared_base + row_group * kScoreTileN * kScoreTileK,
+                  kScoreTileK);
+            } else {
+              wmma::load_matrix_sync(v_frag, k_shared[warp], kScoreTileN);
+            }
             wmma::mma_sync(pv_acc_frag, p_frag, v_frag, pv_acc_frag);
           }
           __syncwarp();
@@ -4175,7 +4223,9 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
         if constexpr (PVMmaMode == 10 || PVMmaMode == 12 || PVMmaMode == 13 ||
                       PVMmaMode == 14 || PVMmaMode == 15 ||
                       PVMmaMode == 16 || PVMmaMode == 17 ||
-                      PVMmaMode == 18 || PVMmaMode == 19) {
+                      PVMmaMode == 18 || PVMmaMode == 19 ||
+                      PVMmaMode == 20 || PVMmaMode == 21 ||
+                      PVMmaMode == 22) {
           __syncwarp();
           for (int tile_idx = lane; tile_idx < kScoreTileElems; tile_idx += 32) {
             const int head_slot = tile_idx / kScoreTileN;
@@ -4205,7 +4255,9 @@ __global__ void ds4_cuda_fused_v8_mma_partial_kernel(
 
       if constexpr (PVMmaMode != 10 && PVMmaMode != 11 && PVMmaMode != 12 &&
                     PVMmaMode != 16 && PVMmaMode != 17 &&
-                    PVMmaMode != 18 && PVMmaMode != 19) {
+                    PVMmaMode != 18 && PVMmaMode != 19 &&
+                    PVMmaMode != 20 && PVMmaMode != 21 &&
+                    PVMmaMode != 22) {
         for (int idx = threadIdx.x;
              idx < kPartialPvDimRoundGroups * kV11DimGroups * kScoreTileElems;
              idx += blockDim.x) {
@@ -8579,7 +8631,10 @@ torch::Tensor launch_ds4_cuda_attention(
     case AttentionVariant::kOptimizedV45:
     case AttentionVariant::kOptimizedV46:
     case AttentionVariant::kOptimizedV47:
-    case AttentionVariant::kOptimizedV48: {
+    case AttentionVariant::kOptimizedV48:
+    case AttentionVariant::kOptimizedV49A:
+    case AttentionVariant::kOptimizedV49B:
+    case AttentionVariant::kOptimizedV49: {
       const bool cache_scales = variant != AttentionVariant::kOptimizedV8;
       const bool tensor_core_pv = variant == AttentionVariant::kOptimizedV10;
       const bool tensor_core_pv_parallel = variant == AttentionVariant::kOptimizedV11;
@@ -8607,6 +8662,9 @@ torch::Tensor launch_ds4_cuda_attention(
           variant == AttentionVariant::kOptimizedV46 ||
           variant == AttentionVariant::kOptimizedV47 ||
           variant == AttentionVariant::kOptimizedV48 ||
+          variant == AttentionVariant::kOptimizedV49A ||
+          variant == AttentionVariant::kOptimizedV49B ||
+          variant == AttentionVariant::kOptimizedV49 ||
           variant == AttentionVariant::kOptimizedV28 ||
           variant == AttentionVariant::kOptimizedV29 ||
           variant == AttentionVariant::kOptimizedV30 ||
@@ -8636,7 +8694,10 @@ torch::Tensor launch_ds4_cuda_attention(
           variant == AttentionVariant::kOptimizedV45 ||
           variant == AttentionVariant::kOptimizedV46 ||
           variant == AttentionVariant::kOptimizedV47 ||
-          variant == AttentionVariant::kOptimizedV48;
+          variant == AttentionVariant::kOptimizedV48 ||
+          variant == AttentionVariant::kOptimizedV49A ||
+          variant == AttentionVariant::kOptimizedV49B ||
+          variant == AttentionVariant::kOptimizedV49;
       const bool tensor_core_pv_prepared_kv_rolling_q =
           variant == AttentionVariant::kOptimizedV46;
       const bool tensor_core_pv_prepared_kv_half_pv_warps =
@@ -8647,11 +8708,23 @@ torch::Tensor launch_ds4_cuda_attention(
           variant == AttentionVariant::kOptimizedV45 ||
           variant == AttentionVariant::kOptimizedV46 ||
           variant == AttentionVariant::kOptimizedV47 ||
-          variant == AttentionVariant::kOptimizedV48;
+          variant == AttentionVariant::kOptimizedV48 ||
+          variant == AttentionVariant::kOptimizedV49A ||
+          variant == AttentionVariant::kOptimizedV49B ||
+          variant == AttentionVariant::kOptimizedV49;
       const bool tensor_core_pv_prepared_kv_row32 =
           variant == AttentionVariant::kOptimizedV44;
       const bool tensor_core_pv_prepared_kv_direct_p =
-          variant == AttentionVariant::kOptimizedV45;
+          variant == AttentionVariant::kOptimizedV45 ||
+          variant == AttentionVariant::kOptimizedV49A ||
+          variant == AttentionVariant::kOptimizedV49B ||
+          variant == AttentionVariant::kOptimizedV49;
+      const bool tensor_core_pv_prepared_kv_direct_k_wmma =
+          variant == AttentionVariant::kOptimizedV49A;
+      const bool tensor_core_pv_prepared_kv_direct_v_wmma =
+          variant == AttentionVariant::kOptimizedV49B;
+      const bool tensor_core_pv_prepared_kv_direct_kv_wmma =
+          variant == AttentionVariant::kOptimizedV49;
       const bool tensor_core_pv_prepared_p_split =
           variant == AttentionVariant::kOptimizedV48;
       const bool tensor_core_pv_grouped_head_k_reuse =
@@ -8692,6 +8765,9 @@ torch::Tensor launch_ds4_cuda_attention(
           variant == AttentionVariant::kOptimizedV46 ||
           variant == AttentionVariant::kOptimizedV47 ||
           variant == AttentionVariant::kOptimizedV48 ||
+          variant == AttentionVariant::kOptimizedV49A ||
+          variant == AttentionVariant::kOptimizedV49B ||
+          variant == AttentionVariant::kOptimizedV49 ||
           variant == AttentionVariant::kOptimizedV28 ||
           variant == AttentionVariant::kOptimizedV29 ||
           variant == AttentionVariant::kOptimizedV30 ||
@@ -8716,6 +8792,9 @@ torch::Tensor launch_ds4_cuda_attention(
           variant == AttentionVariant::kOptimizedV46 ||
           variant == AttentionVariant::kOptimizedV47 ||
           variant == AttentionVariant::kOptimizedV48 ||
+          variant == AttentionVariant::kOptimizedV49A ||
+          variant == AttentionVariant::kOptimizedV49B ||
+          variant == AttentionVariant::kOptimizedV49 ||
           variant == AttentionVariant::kOptimizedV28 ||
           variant == AttentionVariant::kOptimizedV29 ||
           variant == AttentionVariant::kOptimizedV30 ||
@@ -8739,6 +8818,9 @@ torch::Tensor launch_ds4_cuda_attention(
           variant == AttentionVariant::kOptimizedV46 ||
           variant == AttentionVariant::kOptimizedV47 ||
           variant == AttentionVariant::kOptimizedV48 ||
+          variant == AttentionVariant::kOptimizedV49A ||
+          variant == AttentionVariant::kOptimizedV49B ||
+          variant == AttentionVariant::kOptimizedV49 ||
           variant == AttentionVariant::kOptimizedV28 ||
           variant == AttentionVariant::kOptimizedV29 ||
           variant == AttentionVariant::kOptimizedV30 ||
@@ -9872,6 +9954,60 @@ torch::Tensor launch_ds4_cuda_attention(
                         prepared_k_ptr,
                         prepared_v_ptr);
               }
+            } else if (
+                tensor_core_pv_prepared_kv_direct_k_wmma ||
+                tensor_core_pv_prepared_kv_direct_v_wmma ||
+                tensor_core_pv_prepared_kv_direct_kv_wmma) {
+#define DSV4_LAUNCH_DIRECT_PREPARED_KV(MODE, PROFILE, PROFILE_PTR)        \
+  ds4_cuda_fused_v8_mma_partial_kernel<false, MODE, __nv_bfloat16, PROFILE> \
+      <<<split_grid, split_block, 0, stream>>>(                            \
+          reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()), \
+          swa_k_cache.data_ptr<uint8_t>(),                                  \
+          swa_indices.data_ptr<int32_t>(),                                  \
+          swa_topk_lengths.data_ptr<int32_t>(),                             \
+          static_cast<int>(swa_width),                                      \
+          static_cast<int>(swa_page_size),                                  \
+          static_cast<int>(swa_k_cache.size(3)),                            \
+          has_extra ? extra_k_cache.data_ptr<uint8_t>() : nullptr,          \
+          has_extra ? extra_indices.data_ptr<int32_t>() : nullptr,          \
+          has_extra ? extra_topk_lengths.data_ptr<int32_t>() : nullptr,     \
+          static_cast<int>(extra_width),                                    \
+          static_cast<int>(extra_page_size),                                \
+          has_extra ? static_cast<int>(extra_k_cache.size(3)) : 0,          \
+          has_extra,                                                        \
+          static_cast<float>(softmax_scale),                                \
+          static_cast<int>(batch_size),                                     \
+          static_cast<int>(num_heads),                                      \
+          static_cast<int>(total_width),                                    \
+          static_cast<int>(head_tiles),                                     \
+          static_cast<int>(row_tiles),                                      \
+          partial_max.data_ptr<float>(),                                    \
+          partial_sum.data_ptr<float>(),                                    \
+          reinterpret_cast<__nv_bfloat16*>(                                 \
+              partial_acc.data_ptr<at::BFloat16>()),                        \
+          PROFILE_PTR,                                                      \
+          prepared_k_ptr,                                                   \
+          prepared_v_ptr)
+              if (tensor_core_pv_prepared_kv_direct_k_wmma) {
+                if (profile_partial_stages) {
+                  DSV4_LAUNCH_DIRECT_PREPARED_KV(20, true, partial_stage_profile_ptr);
+                } else {
+                  DSV4_LAUNCH_DIRECT_PREPARED_KV(20, false, nullptr);
+                }
+              } else if (tensor_core_pv_prepared_kv_direct_v_wmma) {
+                if (profile_partial_stages) {
+                  DSV4_LAUNCH_DIRECT_PREPARED_KV(21, true, partial_stage_profile_ptr);
+                } else {
+                  DSV4_LAUNCH_DIRECT_PREPARED_KV(21, false, nullptr);
+                }
+              } else {
+                if (profile_partial_stages) {
+                  DSV4_LAUNCH_DIRECT_PREPARED_KV(22, true, partial_stage_profile_ptr);
+                } else {
+                  DSV4_LAUNCH_DIRECT_PREPARED_KV(22, false, nullptr);
+                }
+              }
+#undef DSV4_LAUNCH_DIRECT_PREPARED_KV
             } else if (tensor_core_pv_prepared_kv_direct_p) {
               if (profile_partial_stages) {
                 ds4_cuda_fused_v8_mma_partial_kernel<false, 17, __nv_bfloat16, true>
@@ -12518,6 +12654,87 @@ torch::Tensor ds4_cuda_optimized_v48_attention(
       extra_topk_lengths,
       extra_page_size,
       AttentionVariant::kOptimizedV48);
+}
+
+torch::Tensor ds4_cuda_optimized_v49a_attention(
+    torch::Tensor q,
+    torch::Tensor swa_k_cache,
+    torch::Tensor swa_indices,
+    torch::Tensor swa_topk_lengths,
+    int64_t swa_page_size,
+    double softmax_scale,
+    torch::Tensor attn_sink,
+    torch::Tensor extra_k_cache,
+    torch::Tensor extra_indices,
+    torch::Tensor extra_topk_lengths,
+    int64_t extra_page_size) {
+  return launch_ds4_cuda_attention(
+      q,
+      swa_k_cache,
+      swa_indices,
+      swa_topk_lengths,
+      swa_page_size,
+      softmax_scale,
+      attn_sink,
+      extra_k_cache,
+      extra_indices,
+      extra_topk_lengths,
+      extra_page_size,
+      AttentionVariant::kOptimizedV49A);
+}
+
+torch::Tensor ds4_cuda_optimized_v49b_attention(
+    torch::Tensor q,
+    torch::Tensor swa_k_cache,
+    torch::Tensor swa_indices,
+    torch::Tensor swa_topk_lengths,
+    int64_t swa_page_size,
+    double softmax_scale,
+    torch::Tensor attn_sink,
+    torch::Tensor extra_k_cache,
+    torch::Tensor extra_indices,
+    torch::Tensor extra_topk_lengths,
+    int64_t extra_page_size) {
+  return launch_ds4_cuda_attention(
+      q,
+      swa_k_cache,
+      swa_indices,
+      swa_topk_lengths,
+      swa_page_size,
+      softmax_scale,
+      attn_sink,
+      extra_k_cache,
+      extra_indices,
+      extra_topk_lengths,
+      extra_page_size,
+      AttentionVariant::kOptimizedV49B);
+}
+
+torch::Tensor ds4_cuda_optimized_v49_attention(
+    torch::Tensor q,
+    torch::Tensor swa_k_cache,
+    torch::Tensor swa_indices,
+    torch::Tensor swa_topk_lengths,
+    int64_t swa_page_size,
+    double softmax_scale,
+    torch::Tensor attn_sink,
+    torch::Tensor extra_k_cache,
+    torch::Tensor extra_indices,
+    torch::Tensor extra_topk_lengths,
+    int64_t extra_page_size) {
+  return launch_ds4_cuda_attention(
+      q,
+      swa_k_cache,
+      swa_indices,
+      swa_topk_lengths,
+      swa_page_size,
+      softmax_scale,
+      attn_sink,
+      extra_k_cache,
+      extra_indices,
+      extra_topk_lengths,
+      extra_page_size,
+      AttentionVariant::kOptimizedV49);
 }
 
 torch::Tensor ds4_cuda_reference_scores(
