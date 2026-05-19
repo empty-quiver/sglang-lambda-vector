@@ -139,6 +139,38 @@ void ds4_cuda_launch_v53_warp_softmax_rowgroup_k_direct_prepared_wmma_partial(
     const __nv_bfloat16* prepared_k,
     const __nv_bfloat16* prepared_v);
 
+void ds4_cuda_launch_v54_staged_k_warp_softmax_rowgroup_direct_prepared_wmma_partial(
+    dim3 grid,
+    dim3 block,
+    cudaStream_t stream,
+    bool profile_stages,
+    const __nv_bfloat16* q,
+    const uint8_t* swa_cache,
+    const int32_t* swa_indices,
+    const int32_t* swa_lengths,
+    int swa_width,
+    int swa_page_size,
+    int swa_row_stride,
+    const uint8_t* extra_cache,
+    const int32_t* extra_indices,
+    const int32_t* extra_lengths,
+    int extra_width,
+    int extra_page_size,
+    int extra_row_stride,
+    bool has_extra,
+    float softmax_scale,
+    int batch_size,
+    int num_heads,
+    int total_width,
+    int head_tiles,
+    int row_tiles,
+    float* partial_max,
+    float* partial_sum,
+    __nv_bfloat16* partial_acc,
+    unsigned long long* profile_cycles,
+    const __nv_bfloat16* prepared_k,
+    const __nv_bfloat16* prepared_v);
+
 namespace {
 
 constexpr int kNopeDim = 448;
@@ -362,6 +394,7 @@ enum class AttentionVariant : int {
   kOptimizedV51 = 53,
   kOptimizedV52 = 54,
   kOptimizedV53 = 55,
+  kOptimizedV54 = 56,
 };
 
 const char* attention_variant_name(AttentionVariant variant) {
@@ -476,6 +509,8 @@ const char* attention_variant_name(AttentionVariant variant) {
       return "v52";
     case AttentionVariant::kOptimizedV53:
       return "v53";
+    case AttentionVariant::kOptimizedV54:
+      return "v54";
   }
   return "unknown";
 }
@@ -8786,7 +8821,8 @@ torch::Tensor launch_ds4_cuda_attention(
     case AttentionVariant::kOptimizedV50:
     case AttentionVariant::kOptimizedV51:
     case AttentionVariant::kOptimizedV52:
-    case AttentionVariant::kOptimizedV53: {
+    case AttentionVariant::kOptimizedV53:
+    case AttentionVariant::kOptimizedV54: {
       const bool cache_scales = variant != AttentionVariant::kOptimizedV8;
       const bool tensor_core_pv = variant == AttentionVariant::kOptimizedV10;
       const bool tensor_core_pv_parallel = variant == AttentionVariant::kOptimizedV11;
@@ -8799,7 +8835,8 @@ torch::Tensor launch_ds4_cuda_attention(
           variant == AttentionVariant::kOptimizedV50 ||
           variant == AttentionVariant::kOptimizedV51 ||
           variant == AttentionVariant::kOptimizedV52 ||
-          variant == AttentionVariant::kOptimizedV53;
+          variant == AttentionVariant::kOptimizedV53 ||
+          variant == AttentionVariant::kOptimizedV54;
       const bool tensor_core_pv_rowgroup_accum =
           variant == AttentionVariant::kOptimizedV15 ||
           variant == AttentionVariant::kOptimizedV16 ||
@@ -8876,7 +8913,8 @@ torch::Tensor launch_ds4_cuda_attention(
           variant == AttentionVariant::kOptimizedV44;
       const bool tensor_core_pv_prepared_kv_rowgroup_k =
           variant == AttentionVariant::kOptimizedV52 ||
-          variant == AttentionVariant::kOptimizedV53;
+          variant == AttentionVariant::kOptimizedV53 ||
+          variant == AttentionVariant::kOptimizedV54;
       const bool tensor_core_pv_prepared_kv_direct_p =
           variant == AttentionVariant::kOptimizedV45 ||
           variant == AttentionVariant::kOptimizedV49A ||
@@ -8896,6 +8934,8 @@ torch::Tensor launch_ds4_cuda_attention(
           variant == AttentionVariant::kOptimizedV52;
       const bool tensor_core_pv_v53_warp_softmax_rowgroup_k_direct_prepared_wmma =
           variant == AttentionVariant::kOptimizedV53;
+      const bool tensor_core_pv_v54_staged_k_warp_softmax_rowgroup_direct_prepared_wmma =
+          variant == AttentionVariant::kOptimizedV54;
       const bool tensor_core_pv_prepared_p_split =
           variant == AttentionVariant::kOptimizedV48;
       const bool tensor_core_pv_grouped_head_k_reuse =
@@ -10140,15 +10180,18 @@ torch::Tensor launch_ds4_cuda_attention(
                 tensor_core_pv_v50_direct_prepared_wmma ||
                 tensor_core_pv_v51_warp_softmax_direct_prepared_wmma ||
                 tensor_core_pv_v52_rowgroup_k_direct_prepared_wmma ||
-                tensor_core_pv_v53_warp_softmax_rowgroup_k_direct_prepared_wmma) {
+                tensor_core_pv_v53_warp_softmax_rowgroup_k_direct_prepared_wmma ||
+                tensor_core_pv_v54_staged_k_warp_softmax_rowgroup_direct_prepared_wmma) {
               auto launch_standalone_direct_prepared =
-                  tensor_core_pv_v53_warp_softmax_rowgroup_k_direct_prepared_wmma
-                  ? ds4_cuda_launch_v53_warp_softmax_rowgroup_k_direct_prepared_wmma_partial
-                  : (tensor_core_pv_v51_warp_softmax_direct_prepared_wmma
-                         ? ds4_cuda_launch_v51_warp_softmax_direct_prepared_wmma_partial
-                         : (tensor_core_pv_v52_rowgroup_k_direct_prepared_wmma
-                                ? ds4_cuda_launch_v52_rowgroup_k_direct_prepared_wmma_partial
-                                : ds4_cuda_launch_v50_direct_prepared_wmma_partial));
+                  tensor_core_pv_v54_staged_k_warp_softmax_rowgroup_direct_prepared_wmma
+                  ? ds4_cuda_launch_v54_staged_k_warp_softmax_rowgroup_direct_prepared_wmma_partial
+                  : (tensor_core_pv_v53_warp_softmax_rowgroup_k_direct_prepared_wmma
+                         ? ds4_cuda_launch_v53_warp_softmax_rowgroup_k_direct_prepared_wmma_partial
+                         : (tensor_core_pv_v51_warp_softmax_direct_prepared_wmma
+                                ? ds4_cuda_launch_v51_warp_softmax_direct_prepared_wmma_partial
+                                : (tensor_core_pv_v52_rowgroup_k_direct_prepared_wmma
+                                       ? ds4_cuda_launch_v52_rowgroup_k_direct_prepared_wmma_partial
+                                       : ds4_cuda_launch_v50_direct_prepared_wmma_partial)));
               launch_standalone_direct_prepared(
                   split_grid,
                   split_block,
@@ -13071,6 +13114,33 @@ torch::Tensor ds4_cuda_optimized_v53_attention(
       extra_topk_lengths,
       extra_page_size,
       AttentionVariant::kOptimizedV53);
+}
+
+torch::Tensor ds4_cuda_optimized_v54_attention(
+    torch::Tensor q,
+    torch::Tensor swa_k_cache,
+    torch::Tensor swa_indices,
+    torch::Tensor swa_topk_lengths,
+    int64_t swa_page_size,
+    double softmax_scale,
+    torch::Tensor attn_sink,
+    torch::Tensor extra_k_cache,
+    torch::Tensor extra_indices,
+    torch::Tensor extra_topk_lengths,
+    int64_t extra_page_size) {
+  return launch_ds4_cuda_attention(
+      q,
+      swa_k_cache,
+      swa_indices,
+      swa_topk_lengths,
+      swa_page_size,
+      softmax_scale,
+      attn_sink,
+      extra_k_cache,
+      extra_indices,
+      extra_topk_lengths,
+      extra_page_size,
+      AttentionVariant::kOptimizedV54);
 }
 
 torch::Tensor ds4_cuda_reference_scores(

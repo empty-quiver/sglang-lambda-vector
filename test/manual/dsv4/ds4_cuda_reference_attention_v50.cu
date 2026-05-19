@@ -178,15 +178,17 @@ __device__ __forceinline__ const uint8_t* selected_combined_row_ptr(
 //   prepared_k[batch, row_tile, dim_tile, dim_slot, row_slot]
 //   prepared_v[batch, row_tile, dim_tile, row_slot, dim_slot]
 //
-// QK consumes prepared_k directly as WMMA matrix_b row-major with leading
-// dimension 64. P@V consumes prepared_v directly as WMMA matrix_b row-major
-// with leading dimension 16. The only cache-local state here is Q reuse,
+// QK consumes prepared_k directly as WMMA matrix_b row-major, or stages one
+// row-group K tile into shared memory for the v54 layout experiment. P@V
+// consumes prepared_v directly as WMMA matrix_b row-major with leading
+// dimension 16. The only cache-local state here is Q reuse, optional staged K,
 // softmax probabilities, and the BF16 partial accumulator consumed by the
 // existing DS4 reduction kernel.
 template <
     bool ProfileStages = false,
     bool WarpSoftmax = false,
-    bool RowGroupPreparedK = false>
+    bool RowGroupPreparedK = false,
+    bool StagedPreparedK = false>
 __global__ void __launch_bounds__(kV8Threads, 1)
 ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
     const __nv_bfloat16* __restrict__ q,
@@ -237,6 +239,8 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
 
   __shared__ __align__(16) __nv_bfloat16
       q_reuse_shared[kScoreKTileCount][kScoreTileElems];
+  __shared__ __align__(16) __nv_bfloat16
+      k_stage_shared[StagedPreparedK ? kPreparedKTileElems : 1];
   __shared__ __align__(16) float score_shared[kV11WarpsPerBlock][kScoreTileElems];
   __shared__ __align__(16) __nv_bfloat16 p_shared[kScoreWarpsPerBlock][kScoreTileElems];
   __shared__ uint8_t row_valid[kScoreRowsPerBlock];
@@ -354,7 +358,29 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
                 kScoreKTileCount +
             (dim_base / kScoreTileK)) *
            kPreparedKTileElems);
-      if constexpr (RowGroupPreparedK) {
+      if constexpr (StagedPreparedK) {
+        static_assert(
+            RowGroupPreparedK,
+            "DS4 v54 staged-K path expects row-group prepared-K layout");
+        constexpr int kRowGroupVecCount =
+            (kScoreTileElems * static_cast<int>(sizeof(__nv_bfloat16))) /
+            static_cast<int>(sizeof(uint4));
+        static_assert(
+            kScoreTileElems * static_cast<int>(sizeof(__nv_bfloat16)) ==
+                kRowGroupVecCount * static_cast<int>(sizeof(uint4)),
+            "DS4 v54 staged-K row-group tile should divide into uint4 copies");
+
+        auto* staged_vec =
+            reinterpret_cast<uint4*>(k_stage_shared + warp * kScoreTileElems);
+        const auto* prepared_vec = reinterpret_cast<const uint4*>(
+            prepared_k + prepared_base + warp * kScoreTileElems);
+        if (lane < kRowGroupVecCount) {
+          staged_vec[lane] = prepared_vec[lane];
+        }
+        __syncwarp();
+        wmma::load_matrix_sync(
+            k_frag, k_stage_shared + warp * kScoreTileElems, kScoreTileK);
+      } else if constexpr (RowGroupPreparedK) {
         wmma::load_matrix_sync(
             k_frag, prepared_k + prepared_base + warp * kScoreTileElems, kScoreTileK);
       } else {
@@ -583,7 +609,7 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
 
 }  // namespace
 
-template <bool WarpSoftmax, bool RowGroupPreparedK>
+template <bool WarpSoftmax, bool RowGroupPreparedK, bool StagedPreparedK>
 void ds4_cuda_launch_direct_prepared_wmma_partial_variant(
     dim3 grid,
     dim3 block,
@@ -619,7 +645,8 @@ void ds4_cuda_launch_direct_prepared_wmma_partial_variant(
     ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel<
         true,
         WarpSoftmax,
-        RowGroupPreparedK>
+        RowGroupPreparedK,
+        StagedPreparedK>
         <<<grid, block, 0, stream>>>(
             q,
             swa_cache,
@@ -651,7 +678,8 @@ void ds4_cuda_launch_direct_prepared_wmma_partial_variant(
     ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel<
         false,
         WarpSoftmax,
-        RowGroupPreparedK>
+        RowGroupPreparedK,
+        StagedPreparedK>
         <<<grid, block, 0, stream>>>(
             q,
             swa_cache,
@@ -682,7 +710,7 @@ void ds4_cuda_launch_direct_prepared_wmma_partial_variant(
   }
 }
 
-#define DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(NAME, WARP_SOFTMAX, ROWGROUP_K) \
+#define DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(NAME, WARP_SOFTMAX, ROWGROUP_K, STAGED_K) \
   void NAME(                                                              \
       dim3 grid,                                                          \
       dim3 block,                                                         \
@@ -716,7 +744,8 @@ void ds4_cuda_launch_direct_prepared_wmma_partial_variant(
       const __nv_bfloat16* prepared_v) {                                  \
     ds4_cuda_launch_direct_prepared_wmma_partial_variant<                 \
         WARP_SOFTMAX,                                                     \
-        ROWGROUP_K>(                                                      \
+        ROWGROUP_K,                                                        \
+        STAGED_K>(                                                         \
         grid,                                                             \
         block,                                                            \
         stream,                                                           \
@@ -752,17 +781,26 @@ void ds4_cuda_launch_direct_prepared_wmma_partial_variant(
 DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     ds4_cuda_launch_v50_direct_prepared_wmma_partial,
     false,
+    false,
     false)
 DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     ds4_cuda_launch_v51_warp_softmax_direct_prepared_wmma_partial,
     true,
+    false,
     false)
 DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     ds4_cuda_launch_v52_rowgroup_k_direct_prepared_wmma_partial,
     false,
-    true)
+    true,
+    false)
 DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     ds4_cuda_launch_v53_warp_softmax_rowgroup_k_direct_prepared_wmma_partial,
+    true,
+    true,
+    false)
+DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
+    ds4_cuda_launch_v54_staged_k_warp_softmax_rowgroup_direct_prepared_wmma_partial,
+    true,
     true,
     true)
 
