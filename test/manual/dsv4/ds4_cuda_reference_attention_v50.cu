@@ -188,7 +188,8 @@ template <
     bool ProfileStages = false,
     bool WarpSoftmax = false,
     bool RowGroupPreparedK = false,
-    bool StagedPreparedK = false>
+    bool StagedPreparedK = false,
+    bool DimSplitQK = false>
 __global__ void __launch_bounds__(kV8Threads, 1)
 ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
     const __nv_bfloat16* __restrict__ q,
@@ -310,7 +311,117 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
   }
 
   unsigned long long qk_barrier_t0 = profile_t0;
-  if (warp < kScoreWarpsPerBlock) {
+  if constexpr (DimSplitQK) {
+    static_assert(
+        WarpSoftmax && RowGroupPreparedK && !StagedPreparedK,
+        "DS4 v55 dim-split QK expects the v53 warp-softmax row-group layout");
+    static_assert(
+        kScoreKTileCount % kV11DimGroups == 0,
+        "DS4 v55 expects the head dimension K tiles to split across dim groups");
+
+    if (warp < kV11WarpsPerBlock) {
+      wmma::fragment<
+          wmma::matrix_a,
+          kScoreTileM,
+          kScoreTileN,
+          kScoreTileK,
+          __nv_bfloat16,
+          wmma::row_major>
+          q_frag;
+      wmma::fragment<
+          wmma::matrix_b,
+          kScoreTileM,
+          kScoreTileN,
+          kScoreTileK,
+          __nv_bfloat16,
+          wmma::row_major>
+          k_frag;
+      wmma::fragment<wmma::accumulator, kScoreTileM, kScoreTileN, kScoreTileK, float>
+          acc_frag;
+      wmma::fill_fragment(acc_frag, 0.0f);
+
+      const int row_group = warp / kV11DimGroups;
+      const int dim_group = warp - row_group * kV11DimGroups;
+#pragma unroll
+      for (int dim_iter = 0; dim_iter < kScoreKTileCount / kV11DimGroups;
+           ++dim_iter) {
+        const int dim_tile = dim_iter * kV11DimGroups + dim_group;
+        const int dim_base = dim_tile * kScoreTileK;
+        unsigned long long qk_detail_t0 = 0;
+        if (profile_this_block && threadIdx.x == 0) {
+          qk_detail_t0 = clock64();
+        }
+        __syncwarp();
+        if (profile_this_block && threadIdx.x == 0) {
+          const unsigned long long now = clock64();
+          const unsigned long long staging_cycles = now - qk_detail_t0;
+          add_partial_profile_cycles(
+              profile_cycles, kPartialProfileQkStagingWall, staging_cycles);
+          add_partial_profile_cycles(
+              profile_cycles,
+              dim_base < kNopeDim ? kPartialProfileQkStagingNopeWall
+                                  : kPartialProfileQkStagingRopeWall,
+              staging_cycles);
+          qk_detail_t0 = now;
+        }
+
+        wmma::load_matrix_sync(q_frag, q_reuse_shared[dim_tile], kScoreTileK);
+        const int64_t prepared_base =
+            (((static_cast<int64_t>(batch) * row_tiles + row_tile) *
+                  kScoreKTileCount +
+              dim_tile) *
+             kPreparedKTileElems);
+        wmma::load_matrix_sync(
+            k_frag,
+            prepared_k + prepared_base + row_group * kScoreTileElems,
+            kScoreTileK);
+        wmma::mma_sync(acc_frag, q_frag, k_frag, acc_frag);
+        __syncwarp();
+        if (profile_this_block && threadIdx.x == 0) {
+          const unsigned long long now = clock64();
+          add_partial_profile_cycles(
+              profile_cycles, kPartialProfileQkMmaWall, now - qk_detail_t0);
+        }
+      }
+
+      unsigned long long qk_store_t0 = 0;
+      if (profile_this_block && threadIdx.x == 0) {
+        qk_store_t0 = clock64();
+      }
+      wmma::store_matrix_sync(
+          score_shared[warp], acc_frag, kScoreTileN, wmma::mem_row_major);
+      if (profile_this_block && threadIdx.x == 0) {
+        const unsigned long long now = clock64();
+        add_partial_profile_cycles(
+            profile_cycles, kPartialProfileQkScoreStoreWall, now - qk_store_t0);
+        qk_barrier_t0 = now;
+      }
+    }
+    __syncthreads();
+
+    if (warp < kScoreWarpsPerBlock) {
+      const int row_group = warp;
+      const int base_slot = row_group * kV11DimGroups;
+      unsigned long long qk_reduce_t0 = 0;
+      if (profile_this_block && threadIdx.x == 0) {
+        qk_reduce_t0 = clock64();
+      }
+      for (int tile_idx = lane; tile_idx < kScoreTileElems; tile_idx += 32) {
+        const float score =
+            score_shared[base_slot][tile_idx] +
+            score_shared[base_slot + 1][tile_idx] +
+            score_shared[base_slot + 2][tile_idx] +
+            score_shared[base_slot + 3][tile_idx];
+        score_shared[base_slot][tile_idx] = score;
+      }
+      if (profile_this_block && threadIdx.x == 0) {
+        const unsigned long long now = clock64();
+        add_partial_profile_cycles(
+            profile_cycles, kPartialProfileQkScoreStoreWall, now - qk_reduce_t0);
+        qk_barrier_t0 = now;
+      }
+    }
+  } else if (warp < kScoreWarpsPerBlock) {
     wmma::fragment<
         wmma::matrix_a,
         kScoreTileM,
@@ -427,8 +538,9 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
         if (head < num_heads && row_valid[row_slot]) {
           const int row_warp = row_slot / kScoreTileN;
           const int row_lane = row_slot - row_warp * kScoreTileN;
+          const int score_warp = DimSplitQK ? row_warp * kV11DimGroups : row_warp;
           const float score =
-              score_shared[row_warp][head_slot * kScoreTileN + row_lane] *
+              score_shared[score_warp][head_slot * kScoreTileN + row_lane] *
               softmax_scale;
           local_max = fmaxf(local_max, score);
         }
@@ -443,8 +555,9 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
         if (head < num_heads && row_valid[row_slot]) {
           const int row_warp = row_slot / kScoreTileN;
           const int row_lane = row_slot - row_warp * kScoreTileN;
+          const int score_warp = DimSplitQK ? row_warp * kV11DimGroups : row_warp;
           const float score =
-              score_shared[row_warp][head_slot * kScoreTileN + row_lane] *
+              score_shared[score_warp][head_slot * kScoreTileN + row_lane] *
               softmax_scale;
           weight = expf(score - tile_max);
           local_sum += weight;
@@ -478,8 +591,9 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
       if (head < num_heads && row_valid[row_slot]) {
         const int row_warp = row_slot / kScoreTileN;
         const int row_lane = row_slot - row_warp * kScoreTileN;
+        const int score_warp = DimSplitQK ? row_warp * kV11DimGroups : row_warp;
         const float score =
-            score_shared[row_warp][head_slot * kScoreTileN + row_lane] * softmax_scale;
+            score_shared[score_warp][head_slot * kScoreTileN + row_lane] * softmax_scale;
         tile_max = fmaxf(tile_max, score);
       }
     }
@@ -491,8 +605,9 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
       if (head < num_heads && row_valid[row_slot]) {
         const int row_warp = row_slot / kScoreTileN;
         const int row_lane = row_slot - row_warp * kScoreTileN;
+        const int score_warp = DimSplitQK ? row_warp * kV11DimGroups : row_warp;
         const float score =
-            score_shared[row_warp][head_slot * kScoreTileN + row_lane] * softmax_scale;
+            score_shared[score_warp][head_slot * kScoreTileN + row_lane] * softmax_scale;
         weight = expf(score - tile_max);
         tile_sum += weight;
       }
@@ -609,7 +724,11 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
 
 }  // namespace
 
-template <bool WarpSoftmax, bool RowGroupPreparedK, bool StagedPreparedK>
+template <
+    bool WarpSoftmax,
+    bool RowGroupPreparedK,
+    bool StagedPreparedK,
+    bool DimSplitQK>
 void ds4_cuda_launch_direct_prepared_wmma_partial_variant(
     dim3 grid,
     dim3 block,
@@ -646,7 +765,8 @@ void ds4_cuda_launch_direct_prepared_wmma_partial_variant(
         true,
         WarpSoftmax,
         RowGroupPreparedK,
-        StagedPreparedK>
+        StagedPreparedK,
+        DimSplitQK>
         <<<grid, block, 0, stream>>>(
             q,
             swa_cache,
@@ -679,7 +799,8 @@ void ds4_cuda_launch_direct_prepared_wmma_partial_variant(
         false,
         WarpSoftmax,
         RowGroupPreparedK,
-        StagedPreparedK>
+        StagedPreparedK,
+        DimSplitQK>
         <<<grid, block, 0, stream>>>(
             q,
             swa_cache,
@@ -710,7 +831,8 @@ void ds4_cuda_launch_direct_prepared_wmma_partial_variant(
   }
 }
 
-#define DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(NAME, WARP_SOFTMAX, ROWGROUP_K, STAGED_K) \
+#define DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(                              \
+    NAME, WARP_SOFTMAX, ROWGROUP_K, STAGED_K, DIM_SPLIT_QK)              \
   void NAME(                                                              \
       dim3 grid,                                                          \
       dim3 block,                                                         \
@@ -745,7 +867,8 @@ void ds4_cuda_launch_direct_prepared_wmma_partial_variant(
     ds4_cuda_launch_direct_prepared_wmma_partial_variant<                 \
         WARP_SOFTMAX,                                                     \
         ROWGROUP_K,                                                        \
-        STAGED_K>(                                                         \
+        STAGED_K,                                                          \
+        DIM_SPLIT_QK>(                                                     \
         grid,                                                             \
         block,                                                            \
         stream,                                                           \
@@ -782,26 +905,37 @@ DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     ds4_cuda_launch_v50_direct_prepared_wmma_partial,
     false,
     false,
+    false,
     false)
 DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     ds4_cuda_launch_v51_warp_softmax_direct_prepared_wmma_partial,
     true,
+    false,
     false,
     false)
 DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     ds4_cuda_launch_v52_rowgroup_k_direct_prepared_wmma_partial,
     false,
     true,
+    false,
     false)
 DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     ds4_cuda_launch_v53_warp_softmax_rowgroup_k_direct_prepared_wmma_partial,
     true,
     true,
+    false,
     false)
 DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     ds4_cuda_launch_v54_staged_k_warp_softmax_rowgroup_direct_prepared_wmma_partial,
     true,
     true,
+    true,
+    false)
+DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
+    ds4_cuda_launch_v55_dimsplit_qk_warp_softmax_rowgroup_direct_prepared_wmma_partial,
+    true,
+    true,
+    false,
     true)
 
 #undef DSV4_DEFINE_DIRECT_PREPARED_LAUNCH
