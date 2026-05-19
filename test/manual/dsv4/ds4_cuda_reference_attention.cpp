@@ -767,6 +767,28 @@ torch::Tensor ds4_cuda_optimized_v57_attention(
     torch::Tensor extra_topk_lengths,
     int64_t extra_page_size);
 
+#define DSV4_DECLARE_OPTIMIZED_ATTENTION(NAME) \
+  torch::Tensor NAME(                          \
+      torch::Tensor q,                         \
+      torch::Tensor swa_k_cache,               \
+      torch::Tensor swa_indices,               \
+      torch::Tensor swa_topk_lengths,          \
+      int64_t swa_page_size,                   \
+      double softmax_scale,                    \
+      torch::Tensor attn_sink,                 \
+      torch::Tensor extra_k_cache,             \
+      torch::Tensor extra_indices,             \
+      torch::Tensor extra_topk_lengths,        \
+      int64_t extra_page_size);
+
+DSV4_DECLARE_OPTIMIZED_ATTENTION(ds4_cuda_optimized_v58a_attention)
+DSV4_DECLARE_OPTIMIZED_ATTENTION(ds4_cuda_optimized_v58b_attention)
+DSV4_DECLARE_OPTIMIZED_ATTENTION(ds4_cuda_optimized_v58_attention)
+DSV4_DECLARE_OPTIMIZED_ATTENTION(ds4_cuda_optimized_v59_attention)
+DSV4_DECLARE_OPTIMIZED_ATTENTION(ds4_cuda_optimized_v60_attention)
+
+#undef DSV4_DECLARE_OPTIMIZED_ATTENTION
+
 torch::Tensor ds4_cuda_reference_scores(
     torch::Tensor q,
     torch::Tensor swa_k_cache,
@@ -1028,6 +1050,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "ds4_cuda_optimized_v57_attention",
       &ds4_cuda_optimized_v57_attention,
       "Debug CUDA DS4 sparse attention optimized v57 common-path single-scale prepared-KV producer with v53 consumer");
+  m.def(
+      "ds4_cuda_optimized_v58a_attention",
+      &ds4_cuda_optimized_v58a_attention,
+      "Debug CUDA DS4 sparse attention optimized v58a K matrix-B col-major prepared contract");
+  m.def(
+      "ds4_cuda_optimized_v58b_attention",
+      &ds4_cuda_optimized_v58b_attention,
+      "Debug CUDA DS4 sparse attention optimized v58b V matrix-B col-major prepared contract");
+  m.def(
+      "ds4_cuda_optimized_v58_attention",
+      &ds4_cuda_optimized_v58_attention,
+      "Debug CUDA DS4 sparse attention optimized v58 K/V matrix-B col-major prepared contract");
+  m.def(
+      "ds4_cuda_optimized_v59_attention",
+      &ds4_cuda_optimized_v59_attention,
+      "Debug CUDA DS4 sparse attention optimized v59 Q/P matrix-A col-major shared contract");
+  m.def(
+      "ds4_cuda_optimized_v60_attention",
+      &ds4_cuda_optimized_v60_attention,
+      "Debug CUDA DS4 sparse attention optimized v60 combined A/B col-major fragment contract");
   m.def(
       "ds4_cuda_reference_scores",
       &ds4_cuda_reference_scores,

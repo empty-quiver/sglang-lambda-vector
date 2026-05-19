@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 
 namespace {
 
@@ -178,6 +179,11 @@ __device__ __forceinline__ const uint8_t* selected_combined_row_ptr(
 //   prepared_k[batch, row_tile, dim_tile, dim_slot, row_slot]
 //   prepared_v[batch, row_tile, dim_tile, row_slot, dim_slot]
 //
+// v58-v60 optionally flip these prepared/shared fragment contracts:
+//   K as matrix_b col-major: [row_group, row_lane, dim_slot]
+//   V as matrix_b col-major: [row_group, dim_slot, row_lane]
+//   Q/P as matrix_a col-major in shared: [dim/row, head]
+//
 // QK consumes prepared_k directly as WMMA matrix_b row-major, or stages one
 // row-group K tile into shared memory for the v54 layout experiment. P@V
 // consumes prepared_v directly as WMMA matrix_b row-major with leading
@@ -189,7 +195,10 @@ template <
     bool WarpSoftmax = false,
     bool RowGroupPreparedK = false,
     bool StagedPreparedK = false,
-    bool DimSplitQK = false>
+    bool DimSplitQK = false,
+    bool KColMajorB = false,
+    bool VColMajorB = false,
+    bool AColMajor = false>
 __global__ void __launch_bounds__(kV8Threads, 1)
 ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
     const __nv_bfloat16* __restrict__ q,
@@ -219,6 +228,15 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
     const __nv_bfloat16* __restrict__ prepared_k,
     const __nv_bfloat16* __restrict__ prepared_v) {
   namespace wmma = nvcuda::wmma;
+  using MatrixALayout =
+      std::conditional_t<AColMajor, wmma::col_major, wmma::row_major>;
+  using KMatrixBLayout =
+      std::conditional_t<KColMajorB, wmma::col_major, wmma::row_major>;
+  using VMatrixBLayout =
+      std::conditional_t<VColMajorB, wmma::col_major, wmma::row_major>;
+  static_assert(
+      !StagedPreparedK || !KColMajorB,
+      "staged prepared-K expects the row-major B prepared-K contract");
 
   const int batch = blockIdx.x;
   const int head_tile = blockIdx.y;
@@ -298,7 +316,9 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
     const int dim = dim_tile * kScoreTileK + q_dim_slot;
     const int64_t q_offset =
         (static_cast<int64_t>(batch) * num_heads + head) * kHeadDim + dim;
-    q_reuse_shared[dim_tile][tile_idx] =
+    const int q_store_idx =
+        AColMajor ? q_dim_slot * kScoreTileM + q_head_slot : tile_idx;
+    q_reuse_shared[dim_tile][q_store_idx] =
         head < num_heads ? q[q_offset] : __float2bfloat16(0.0f);
   }
   __syncthreads();
@@ -326,7 +346,7 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
           kScoreTileN,
           kScoreTileK,
           __nv_bfloat16,
-          wmma::row_major>
+          MatrixALayout>
           q_frag;
       wmma::fragment<
           wmma::matrix_b,
@@ -334,7 +354,7 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
           kScoreTileN,
           kScoreTileK,
           __nv_bfloat16,
-          wmma::row_major>
+          KMatrixBLayout>
           k_frag;
       wmma::fragment<wmma::accumulator, kScoreTileM, kScoreTileN, kScoreTileK, float>
           acc_frag;
@@ -373,8 +393,8 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
              kPreparedKTileElems);
         wmma::load_matrix_sync(
             k_frag,
-            prepared_k + prepared_base + row_group * kScoreTileElems,
-            kScoreTileK);
+          prepared_k + prepared_base + row_group * kScoreTileElems,
+          kScoreTileK);
         wmma::mma_sync(acc_frag, q_frag, k_frag, acc_frag);
         __syncwarp();
         if (profile_this_block && threadIdx.x == 0) {
@@ -428,7 +448,7 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
         kScoreTileN,
         kScoreTileK,
         __nv_bfloat16,
-        wmma::row_major>
+        MatrixALayout>
         q_frag;
     wmma::fragment<
         wmma::matrix_b,
@@ -436,7 +456,7 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
         kScoreTileN,
         kScoreTileK,
         __nv_bfloat16,
-        wmma::row_major>
+        KMatrixBLayout>
         k_frag;
     wmma::fragment<wmma::accumulator, kScoreTileM, kScoreTileN, kScoreTileK, float>
         acc_frag;
@@ -564,7 +584,10 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
         }
         const int row_warp = row_slot / kScoreTileN;
         const int row_lane = row_slot - row_warp * kScoreTileN;
-        p_shared[row_warp][head_slot * kScoreTileN + row_lane] =
+        const int p_idx =
+            AColMajor ? row_lane * kScoreTileM + head_slot
+                      : head_slot * kScoreTileN + row_lane;
+        p_shared[row_warp][p_idx] =
             __float2bfloat16(weight);
       }
       float tile_sum = warp_reduce_sum(local_sum);
@@ -613,7 +636,10 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
       }
       const int row_warp = row_slot / kScoreTileN;
       const int row_lane = row_slot - row_warp * kScoreTileN;
-      p_shared[row_warp][head_slot * kScoreTileN + row_lane] =
+      const int p_idx =
+          AColMajor ? row_lane * kScoreTileM + head_slot
+                    : head_slot * kScoreTileN + row_lane;
+      p_shared[row_warp][p_idx] =
           __float2bfloat16(weight);
     }
     tile_max_shared[head_slot] = tile_max;
@@ -648,7 +674,7 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
       kScoreTileN,
       kScoreTileK,
       __nv_bfloat16,
-      wmma::row_major>
+      MatrixALayout>
       p_frag;
   wmma::fragment<
       wmma::matrix_b,
@@ -656,7 +682,7 @@ ds4_cuda_fused_v50_direct_prepared_wmma_partial_kernel(
       kScoreTileN,
       kScoreTileK,
       __nv_bfloat16,
-      wmma::row_major>
+      VMatrixBLayout>
       v_frag;
   wmma::fragment<wmma::accumulator, kScoreTileM, kScoreTileN, kScoreTileK, float>
       pv_acc_frag;
@@ -728,7 +754,10 @@ template <
     bool WarpSoftmax,
     bool RowGroupPreparedK,
     bool StagedPreparedK,
-    bool DimSplitQK>
+    bool DimSplitQK,
+    bool KColMajorB,
+    bool VColMajorB,
+    bool AColMajor>
 void ds4_cuda_launch_direct_prepared_wmma_partial_variant(
     dim3 grid,
     dim3 block,
@@ -766,7 +795,10 @@ void ds4_cuda_launch_direct_prepared_wmma_partial_variant(
         WarpSoftmax,
         RowGroupPreparedK,
         StagedPreparedK,
-        DimSplitQK>
+        DimSplitQK,
+        KColMajorB,
+        VColMajorB,
+        AColMajor>
         <<<grid, block, 0, stream>>>(
             q,
             swa_cache,
@@ -800,7 +832,10 @@ void ds4_cuda_launch_direct_prepared_wmma_partial_variant(
         WarpSoftmax,
         RowGroupPreparedK,
         StagedPreparedK,
-        DimSplitQK>
+        DimSplitQK,
+        KColMajorB,
+        VColMajorB,
+        AColMajor>
         <<<grid, block, 0, stream>>>(
             q,
             swa_cache,
@@ -832,7 +867,8 @@ void ds4_cuda_launch_direct_prepared_wmma_partial_variant(
 }
 
 #define DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(                              \
-    NAME, WARP_SOFTMAX, ROWGROUP_K, STAGED_K, DIM_SPLIT_QK)              \
+    NAME, WARP_SOFTMAX, ROWGROUP_K, STAGED_K, DIM_SPLIT_QK, K_COL_B,     \
+    V_COL_B, A_COL)                                                       \
   void NAME(                                                              \
       dim3 grid,                                                          \
       dim3 block,                                                         \
@@ -868,7 +904,10 @@ void ds4_cuda_launch_direct_prepared_wmma_partial_variant(
         WARP_SOFTMAX,                                                     \
         ROWGROUP_K,                                                        \
         STAGED_K,                                                          \
-        DIM_SPLIT_QK>(                                                     \
+        DIM_SPLIT_QK,                                                      \
+        K_COL_B,                                                           \
+        V_COL_B,                                                           \
+        A_COL>(                                                            \
         grid,                                                             \
         block,                                                            \
         stream,                                                           \
@@ -906,10 +945,16 @@ DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     false,
     false,
     false,
+    false,
+    false,
+    false,
     false)
 DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     ds4_cuda_launch_v51_warp_softmax_direct_prepared_wmma_partial,
     true,
+    false,
+    false,
+    false,
     false,
     false,
     false)
@@ -918,11 +963,17 @@ DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     false,
     true,
     false,
+    false,
+    false,
+    false,
     false)
 DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     ds4_cuda_launch_v53_warp_softmax_rowgroup_k_direct_prepared_wmma_partial,
     true,
     true,
+    false,
+    false,
+    false,
     false,
     false)
 DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
@@ -930,12 +981,63 @@ DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     true,
     true,
     true,
+    false,
+    false,
+    false,
     false)
 DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
     ds4_cuda_launch_v55_dimsplit_qk_warp_softmax_rowgroup_direct_prepared_wmma_partial,
     true,
     true,
     false,
+    true,
+    false,
+    false,
+    false)
+DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
+    ds4_cuda_launch_v58a_k_colmajor_b_direct_prepared_wmma_partial,
+    true,
+    true,
+    false,
+    false,
+    true,
+    false,
+    false)
+DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
+    ds4_cuda_launch_v58b_v_colmajor_b_direct_prepared_wmma_partial,
+    true,
+    true,
+    false,
+    false,
+    false,
+    true,
+    false)
+DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
+    ds4_cuda_launch_v58_kv_colmajor_b_direct_prepared_wmma_partial,
+    true,
+    true,
+    false,
+    false,
+    true,
+    true,
+    false)
+DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
+    ds4_cuda_launch_v59_a_colmajor_direct_prepared_wmma_partial,
+    true,
+    true,
+    false,
+    false,
+    false,
+    false,
+    true)
+DSV4_DEFINE_DIRECT_PREPARED_LAUNCH(
+    ds4_cuda_launch_v60_ab_colmajor_direct_prepared_wmma_partial,
+    true,
+    true,
+    false,
+    false,
+    true,
+    true,
     true)
 
 #undef DSV4_DEFINE_DIRECT_PREPARED_LAUNCH
