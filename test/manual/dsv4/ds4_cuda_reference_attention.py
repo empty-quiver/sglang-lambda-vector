@@ -29,7 +29,7 @@ def _load_extension():
     os.environ.setdefault("MAX_JOBS", str(os.cpu_count() or 4))
 
     return load(
-        name="ds4_cuda_reference_attention_opt_v40_direct_scaled_fp8_ext",
+        name="ds4_cuda_reference_attention_opt_v41_approx_scaled_fp8_ext",
         sources=[
             str(_HERE / "ds4_cuda_reference_attention.cpp"),
             str(_HERE / "ds4_cuda_reference_attention.cu"),
@@ -121,6 +121,8 @@ def _resolve_op(ext, optimized: bool | str | int):
         return ext.ds4_cuda_optimized_v39_attention
     if optimized == 40 or optimized in {"v40", "direct_scaled_fp8"}:
         return ext.ds4_cuda_optimized_v40_attention
+    if optimized == 41 or optimized in {"v41", "approx_scaled_fp8"}:
+        return ext.ds4_cuda_optimized_v41_attention
     raise ValueError(f"unknown DS4 CUDA attention variant: {optimized!r}")
 
 
